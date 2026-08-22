@@ -52,6 +52,15 @@ colcon build --packages-select aqua_slam
 source install/setup.bash
 ```
 
+On machines with limited memory, use the low-memory build script instead. It
+limits both colcon package concurrency and the package's internal Make
+concurrency:
+
+```bash
+./build_low_memory.sh
+source install/setup.bash
+```
+
 ---
 
 ## 4. Launch SLAM + RViz2

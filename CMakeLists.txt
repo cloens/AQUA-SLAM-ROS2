@@ -5,9 +5,9 @@ project(aqua_slam)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -w")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
-# SET(ROS_BUILD_TYPE RelWithDebInfo)  # original (temporary)
-SET(CMAKE_BUILD_TYPE RelWithDebInfo)
-# MESSAGE("Build type: " ${ROS_BUILD_TYPE})  # original (temporary)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "CMake build type" FORCE)
+endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_definitions(-DCOMPILEDWITHC11)
@@ -581,6 +581,12 @@ install(PROGRAMS
   scripts/sim_dvl_converter.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME sim_dvl_converter
+)
+
+install(PROGRAMS
+  scripts/rov_keyboard_teleop.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME rov_keyboard_teleop
 )
 
 ament_package()

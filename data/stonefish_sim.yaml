@@ -130,6 +130,17 @@ T_imu_c: !!opencv-matrix
           0.0,  0.0,  1.0,  0.0,
           0.0,  0.0,  0.0,  1.0 ]
 
+# Legacy ORB-SLAM3 key used by some debug prints/older code paths. Keep it in
+# sync with T_imu_c for this Stonefish setup.
+Tbc: !!opencv-matrix
+  rows: 4
+  cols: 4
+  dt: f
+  data: [ 1.0,  0.0,  0.0, -0.5,
+          0.0,  1.0,  0.0,  0.06,
+          0.0,  0.0,  1.0,  0.0,
+          0.0,  0.0,  0.0,  1.0 ]
+
 T_body_imu: !!opencv-matrix
   rows: 4
   cols: 4

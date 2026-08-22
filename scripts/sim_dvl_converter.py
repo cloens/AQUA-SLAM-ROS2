@@ -8,8 +8,9 @@ stonefish_ros2/DVL fields used:
     header          std_msgs/Header
     velocity        geometry_msgs/Vector3   [m/s, body frame]
     altitude        float32                 [m]
-    status          bool
 """
+
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -24,7 +25,15 @@ class SimDvlConverter(Node):
         self._pub = self.create_publisher(Odometry, '/bluerov2/dvl', 50)
 
     def _cb(self, msg: DVL):
-        if not msg.status:
+        # Current stonefish_ros2 DVL.msg has no status field. Treat non-finite
+        # velocities or non-positive altitude as invalid.
+        if (
+            not math.isfinite(msg.velocity.x)
+            or not math.isfinite(msg.velocity.y)
+            or not math.isfinite(msg.velocity.z)
+            or not math.isfinite(msg.altitude)
+            or msg.altitude <= 0.0
+        ):
             return
 
         odom = Odometry()
