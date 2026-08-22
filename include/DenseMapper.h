@@ -132,6 +132,7 @@ public:
 	std::shared_ptr<image_transport::Publisher> mDepthConfPub;
 // // 	std::shared_ptr<ros::Publisher> mMapPub;  // original  // original
 	rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr mMapPub;
+	rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr mMapAliasPub;
 
 	bool mStop = false;
 	bool mEnable = true;
@@ -167,6 +168,13 @@ protected:
 	void ComputeDisp(const Mat &left, const Mat &right, Mat &out, Mat &out_conf, DepthEstParamters &param);
 
 	void GetSubMap(const Mat &img_l, const Mat &img_r, pcl::PointCloud<pcl::PointXYZRGB> &sub_map);
+	void GetSubMapFromExternalDepth(const Mat &img_l, const Mat &depth_m, pcl::PointCloud<pcl::PointXYZRGB> &sub_map);
+	inline void ProjectDepthTo3D(int x, int y, float z, Eigen::Vector3d &point)
+	{
+		point.z() = z;
+		point.x() = point.z() * (x - cx) / fx;
+		point.y() = point.z() * (y - cy) / fy;
+	}
 
 	void MergeSubMap(pcl::PointCloud<pcl::PointXYZRGB> &sub_map, KeyFrame *pKF);
 

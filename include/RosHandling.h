@@ -169,6 +169,9 @@ protected:
 	nav_msgs::msg::Path m_path_orb;
 // // 	std::shared_ptr<ros::Publisher> mp_path_orb_pub;  // original  // original
 	rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr mp_path_orb_pub;
+	rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mp_pose_alias_pub;
+	rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr mp_path_alias_pub;
+	rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr mp_odom_alias_pub;
 	// body-frame (FLU) outputs — experimental
 	rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr mp_odom_orb_body_pub;
 	rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr mp_path_orb_body_pub;

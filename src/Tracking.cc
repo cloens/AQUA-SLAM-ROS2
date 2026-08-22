@@ -959,7 +959,11 @@ void Tracking::SetStepByStep(bool bSet)
 cv::Mat Tracking::GrabImageStereoDvl(const cv::Mat &imRectLeft,
                                      const cv::Mat &imRectRight,
                                      const double &timestamp,
-                                     bool bDvl, string filename)
+                                     bool bDvl, string filename,
+                                     const std::vector<cv::Point2f>& vExtLeft,
+                                     const std::vector<cv::Point2f>& vExtRight,
+                                     const std::vector<float>& vExtScore,
+                                     const cv::Mat& extDepthScaled)
 {
 	mImLeft = imRectLeft.clone();
 	cv::Mat imGrayRight = imRectRight.clone();
@@ -1018,7 +1022,14 @@ cv::Mat Tracking::GrabImageStereoDvl(const cv::Mat &imRectLeft,
 
 
 	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-	mCurrentFrame.mNameFile = filename;
+	
+	if (!vExtLeft.empty() && !vExtRight.empty()) {
+		mCurrentFrame.ApplyExternalStereoMatches(vExtLeft, vExtRight, vExtScore);
+	}
+	if (!extDepthScaled.empty()) {
+		mCurrentFrame.SetExternalDepth(extDepthScaled);
+	}
+mCurrentFrame.mNameFile = filename;
 	mCurrentFrame.mnDataset = mnNumDataset;
 
 	Track();
@@ -1050,7 +1061,11 @@ cv::Mat Tracking::GrabImageStereoDvlgyro(const Mat &imRectLeft,
                                          const Mat &imRectRight,
                                          const double &timestamp,
                                          bool bDvl,
-                                         string filename)
+                                         string filename,
+                                         const std::vector<cv::Point2f>& vExtLeft,
+                                         const std::vector<cv::Point2f>& vExtRight,
+                                         const std::vector<float>& vExtScore,
+                                         const cv::Mat& extDepthScaled)
 {
 	mImLeft = imRectLeft.clone();
 	cv::Mat imGrayRight = imRectRight.clone();
@@ -1086,7 +1101,14 @@ cv::Mat Tracking::GrabImageStereoDvlgyro(const Mat &imRectLeft,
 	}
 
 
-	mCurrentFrame.mNameFile = filename;
+	
+	if (!vExtLeft.empty() && !vExtRight.empty()) {
+		mCurrentFrame.ApplyExternalStereoMatches(vExtLeft, vExtRight, vExtScore);
+	}
+	if (!extDepthScaled.empty()) {
+		mCurrentFrame.SetExternalDepth(extDepthScaled);
+	}
+mCurrentFrame.mNameFile = filename;
 	mCurrentFrame.mnDataset = mnNumDataset;
 
 	TrackDVLGyro();

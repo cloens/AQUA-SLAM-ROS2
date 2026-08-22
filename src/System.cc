@@ -308,7 +308,11 @@ cv::Mat System::TrackStereoGroDVL(const cv::Mat &imLeft,
                                   const double &timestamp,
                                   const vector<IMU::ImuPoint> &vImuMeas,
                                   bool bDVL,
-                                  string filename)
+                                  string filename,
+                                  const std::vector<cv::Point2f>& vExtLeft,
+                                  const std::vector<cv::Point2f>& vExtRight,
+                                  const std::vector<float>& vExtScore,
+                                  const cv::Mat& extDepthScaled)
 {
 	if (mSensor != DVL_STEREO) {
 		cerr << "ERROR: you called TrackStereo but input sensor was not set to Stereo-DVL." << endl;
@@ -356,7 +360,7 @@ cv::Mat System::TrackStereoGroDVL(const cv::Mat &imLeft,
 		mpTracker->GrabImuData(vImuMeas[i_imu]);
 
 	// std::cout << "start GrabImageStereo" << std::endl;
-	cv::Mat Tcw = mpTracker->GrabImageStereoDvl(imLeft, imRight, timestamp, bDVL, filename);
+	cv::Mat Tcw = mpTracker->GrabImageStereoDvl(imLeft, imRight, timestamp, bDVL, filename, vExtLeft, vExtRight, vExtScore, extDepthScaled);
 //	cv::Mat Tcw;
 
 	// std::cout << "out grabber" << std::endl;
@@ -374,7 +378,11 @@ cv::Mat System::TrackStereoGroDVL(const Mat &imLeft,
                                   const double &timestamp,
                                   const vector<IMU::GyroDvlPoint> &vDVLGyroMeas,
                                   bool bDVL,
-                                  string filename)
+                                  string filename,
+                                  const std::vector<cv::Point2f>& vExtLeft,
+                                  const std::vector<cv::Point2f>& vExtRight,
+                                  const std::vector<float>& vExtScore,
+                                  const cv::Mat& extDepthScaled)
 {
 	if (mSensor != DVL_STEREO) {
 		cerr << "ERROR: you called TrackStereo but input sensor was not set to Stereo-DVL." << endl;
@@ -433,7 +441,7 @@ cv::Mat System::TrackStereoGroDVL(const Mat &imLeft,
     // try-catch
     try {
         // Your operation that may throw an exception
-        Tcw = mpTracker->GrabImageStereoDvlgyro(imLeft, imRight, timestamp, bDVL, filename);
+        Tcw = mpTracker->GrabImageStereoDvlgyro(imLeft, imRight, timestamp, bDVL, filename, vExtLeft, vExtRight, vExtScore, extDepthScaled);
     } catch (const cv::Exception& e) {
         // An exception occurred in the OpenCV functions
 //         ROS_ERROR_STREAM("OpenCV Error: " << e.what());  // original

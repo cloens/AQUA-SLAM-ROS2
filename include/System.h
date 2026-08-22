@@ -127,8 +127,16 @@ public:
     // System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor, const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string(), const string &strLoadingFile = std::string());  // original
     System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor, rclcpp::Node::SharedPtr node, const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string(), const string &strLoadingFile = std::string());
 
-	cv::Mat TrackStereoGroDVL(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::ImuPoint>& vImuMeas = vector<IMU::ImuPoint>(), bool bDVL= false, string filename="");
-	cv::Mat TrackStereoGroDVL(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::GyroDvlPoint>& vDVLGyroMeas = vector<IMU::GyroDvlPoint>(), bool bDVL= false, string filename="");
+	cv::Mat TrackStereoGroDVL(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::ImuPoint>& vImuMeas = vector<IMU::ImuPoint>(), bool bDVL= false, string filename="",
+	                         const std::vector<cv::Point2f>& vExtLeft = std::vector<cv::Point2f>(),
+	                         const std::vector<cv::Point2f>& vExtRight = std::vector<cv::Point2f>(),
+	                         const std::vector<float>& vExtScore = std::vector<float>(),
+	                         const cv::Mat& extDepthScaled = cv::Mat());
+	cv::Mat TrackStereoGroDVL(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::GyroDvlPoint>& vDVLGyroMeas = vector<IMU::GyroDvlPoint>(), bool bDVL= false, string filename="",
+	                         const std::vector<cv::Point2f>& vExtLeft = std::vector<cv::Point2f>(),
+	                         const std::vector<cv::Point2f>& vExtRight = std::vector<cv::Point2f>(),
+	                         const std::vector<float>& vExtScore = std::vector<float>(),
+	                         const cv::Mat& extDepthScaled = cv::Mat());
 	cv::Mat TrackStereoGroDVLKLT(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::ImuPoint>& vImuMeas = vector<IMU::ImuPoint>(), bool bDVL= false, string filename="");
 
     void dvlCallBack(const nav_msgs::msg::Odometry::SharedPtr &dvl);

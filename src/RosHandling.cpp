@@ -68,6 +68,9 @@ RosHandling::RosHandling(System *pSys, LocalMapping *pLocal, rclcpp::Node::Share
 // // 	ros::Publisher path_orb_pub = nh_.advertise<nav_msgs::msg::Path>("/aqua_slam/orb_path", 10);  // original  // original
 // // 	mp_path_orb_pub = std::shared_ptr<ros::Publisher>(boost::make_shared<ros::Publisher>(path_orb_pub));  // original  // original
 	mp_path_orb_pub = mp_node->create_publisher<nav_msgs::msg::Path>("/aqua_slam/orb_path", 10);
+	mp_pose_alias_pub = mp_node->create_publisher<geometry_msgs::msg::PoseStamped>("/aqua_slam/pose", 10);
+	mp_path_alias_pub = mp_node->create_publisher<nav_msgs::msg::Path>("/aqua_slam/path", 10);
+	mp_odom_alias_pub = mp_node->create_publisher<nav_msgs::msg::Odometry>("/aqua_slam/odom", 10);
 	mp_odom_orb_body_pub = mp_node->create_publisher<nav_msgs::msg::Odometry>("/aqua_slam/orb_odom_body", 10);
 	mp_path_orb_body_pub = mp_node->create_publisher<nav_msgs::msg::Path>("/aqua_slam/orb_path_body", 10);
 // // 	ros::Publisher pose_orb_camera_pub = nh_.advertise<nav_msgs::Odometry>("/aqua_slam/camera_pose", 10);  // original  // original
@@ -265,10 +268,12 @@ void RosHandling::PublishOrb(const Eigen::Isometry3d &T_c0_cj_orb,
     pose_to_pub.pose.orientation.z = rotation_q.z();
     pose_to_pub.pose.orientation.w = rotation_q.w();
     mp_pose_orb_pub->publish(pose_to_pub);
+    if (mp_pose_alias_pub) mp_pose_alias_pub->publish(pose_to_pub);
 
     m_path_orb.header = pose_to_pub.header;
     m_path_orb.poses.push_back(pose_to_pub);
     mp_path_orb_pub->publish(m_path_orb);
+    if (mp_path_alias_pub) mp_path_alias_pub->publish(m_path_orb);
 
     Eigen::Isometry3d T_w_rviz = T_w_cj * T_c_rviz;
     BroadcastTF(T_w_rviz, "aqua_slam", "bluerov/base_link");
@@ -284,6 +289,7 @@ void RosHandling::PublishOrb(const Eigen::Isometry3d &T_c0_cj_orb,
         odom.twist.twist.linear.z = Vwb_f.at<float>(2);
     }
     mp_odom_orb_pub->publish(odom);
+    if (mp_odom_alias_pub) mp_odom_alias_pub->publish(odom);
 
     if (mb_calib_initialized) {
         Eigen::Isometry3d T_w_bj = T_w_cj * mT_imu_c.inverse() * mT_body_imu.inverse();

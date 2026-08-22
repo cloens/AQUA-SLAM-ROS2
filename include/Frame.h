@@ -122,6 +122,14 @@ public:
     // If there is a match, depth is computed and the right coordinate associated to the left keypoint is stored.
     void ComputeStereoMatches();
 
+    // UW_SLAM seam: overwrite stereo geometry from external LEFT↔RIGHT matches.
+    void ApplyExternalStereoMatches(const std::vector<cv::Point2f>& vLeft,
+                                   const std::vector<cv::Point2f>& vRight,
+                                   const std::vector<float>& vScore = std::vector<float>());
+
+    // UW_SLAM seam: metric Stereo-Scaled DA2 depth for DenseMapper.
+    void SetExternalDepth(const cv::Mat& depthScaled);
+
     // Associate a "right" coordinate to a keypoint if there is valid depth in the depthmap.
     void ComputeStereoFromRGBD(const cv::Mat &imDepth);
 
@@ -345,6 +353,7 @@ public:
     cv::Mat UnprojectStereoFishEye(const int &i);
 
     cv::Mat imgLeft, imgRight;
+    cv::Mat imgDepthScaled; // UW_SLAM: metric CV_32FC1 depth, empty if unused
 
     void PrintPointDistribution(){
         int left = 0, right = 0;

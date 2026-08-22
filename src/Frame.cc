@@ -106,6 +106,8 @@ Frame::Frame(const Frame &frame)
 
 	frame.imgLeft.copyTo(imgLeft);
 	frame.imgRight.copyTo(imgRight);
+	if (!frame.imgDepthScaled.empty())
+		frame.imgDepthScaled.copyTo(imgDepthScaled);
 }
 
 Frame::Frame(const cv::Mat &imLeft,
@@ -927,6 +929,58 @@ void Frame::ComputeStereoMatches()
 			mvDepth[vDistIdx[i].second] = -1;
 		}
 	}
+}
+
+void Frame::ApplyExternalStereoMatches(const std::vector<cv::Point2f>& vLeft,
+                                      const std::vector<cv::Point2f>& vRight,
+                                      const std::vector<float>& vScore)
+{
+    (void)vScore;
+    mvuRight = vector<float>(N, -1.0f);
+    mvDepth = vector<float>(N, -1.0f);
+    if (N == 0 || vLeft.empty() || vLeft.size() != vRight.size())
+        return;
+
+    const float maxAssocDist2 = 9.0f; // 3px radius
+    for (size_t m = 0; m < vLeft.size(); ++m) {
+        const float ul = vLeft[m].x;
+        const float vl = vLeft[m].y;
+        const float ur = vRight[m].x;
+        float disparity = ul - ur;
+        if (disparity <= 0.5f)
+            continue;
+
+        float bestDist2 = maxAssocDist2;
+        int bestIdx = -1;
+        for (int i = 0; i < N; ++i) {
+            const float dx = mvKeysUn[i].pt.x - ul;
+            const float dy = mvKeysUn[i].pt.y - vl;
+            const float d2 = dx * dx + dy * dy;
+            if (d2 < bestDist2) {
+                bestDist2 = d2;
+                bestIdx = i;
+            }
+        }
+        if (bestIdx < 0)
+            continue;
+
+        // Keep measured disparity, attach it to the nearest ORB keypoint.
+        const float uL = mvKeysUn[bestIdx].pt.x;
+        mvuRight[bestIdx] = uL - disparity;
+        mvDepth[bestIdx] = mbf / disparity;
+    }
+}
+
+void Frame::SetExternalDepth(const cv::Mat& depthScaled)
+{
+    if (depthScaled.empty()) {
+        imgDepthScaled.release();
+        return;
+    }
+    if (depthScaled.type() == CV_32FC1)
+        imgDepthScaled = depthScaled.clone();
+    else
+        depthScaled.convertTo(imgDepthScaled, CV_32FC1);
 }
 
 void Frame::ComputeStereoFromRGBD(const cv::Mat &imDepth)

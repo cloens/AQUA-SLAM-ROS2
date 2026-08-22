@@ -26,6 +26,9 @@
   <depend>tf2_geometry_msgs</depend>
   <depend>message_filters</depend>
 
+  <!-- Optional: UW_SLAM SuperPoint match injection message -->
+  <depend>uw_slam_bridge</depend>
+
   <depend>std_srvs</depend>
 
   <depend>libopencv-dev</depend>

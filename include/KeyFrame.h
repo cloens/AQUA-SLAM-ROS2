@@ -672,6 +672,7 @@ public:
     cv::Mat GetRightTranslation();
 
     cv::Mat imgLeft, imgRight; //TODO Backup??
+    cv::Mat imgDepthScaled; // UW_SLAM: metric scaled DA2 depth
 
 	// DVL EKF
 	Eigen::Isometry3d mT_e0_ej;

@@ -84,12 +84,20 @@ public:
 	                           const cv::Mat &imRectRight,
 	                           const double &timestamp,
 	                           bool bDvl,
-	                           string filename);
+	                           string filename,
+	                           const std::vector<cv::Point2f>& vExtLeft = std::vector<cv::Point2f>(),
+	                           const std::vector<cv::Point2f>& vExtRight = std::vector<cv::Point2f>(),
+	                           const std::vector<float>& vExtScore = std::vector<float>(),
+	                           const cv::Mat& extDepthScaled = cv::Mat());
 	cv::Mat GrabImageStereoDvlgyro(const cv::Mat &imRectLeft,
 	                               const cv::Mat &imRectRight,
 	                               const double &timestamp,
 	                               bool bDvl,
-	                               string filename);
+	                               string filename,
+	                               const std::vector<cv::Point2f>& vExtLeft = std::vector<cv::Point2f>(),
+	                               const std::vector<cv::Point2f>& vExtRight = std::vector<cv::Point2f>(),
+	                               const std::vector<float>& vExtScore = std::vector<float>(),
+	                               const cv::Mat& extDepthScaled = cv::Mat());
 
 	cv::Mat GrabImageStereoDvlKLT(const cv::Mat &imRectLeft,
 	                              const cv::Mat &imRectRight,

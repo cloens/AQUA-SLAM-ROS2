@@ -39,6 +39,7 @@ namespace ORB_SLAM3
 // //         ros::Publisher pointcloud_pub = nh_.advertise<sensor_msgs::msg::PointCloud2>("/aqua_slam/dense_map", 10);  // original  // original
 // //         mMapPub = std::shared_ptr<ros::Publisher>(boost::make_shared<ros::Publisher>(pointcloud_pub));  // original  // original
         mMapPub = mNode->create_publisher<sensor_msgs::msg::PointCloud2>("/aqua_slam/dense_map", 10);
+        mMapAliasPub = mNode->create_publisher<sensor_msgs::msg::PointCloud2>("/aqua_slam/map", 10);
 
         FileStorage fs(settingFile, FileStorage::READ);
         FileNode fsNode = fs["DenseMapper"];
@@ -354,7 +355,63 @@ namespace ORB_SLAM3
         //	sub_map = *local_map;
     }
 
-    void DenseMapper::MergeSubMap(pcl::PointCloud<pcl::PointXYZRGB> &sub_map, KeyFrame* pKF)
+        void DenseMapper::GetSubMapFromExternalDepth(const Mat &img_l, const Mat &depth_m,
+                                                 pcl::PointCloud<pcl::PointXYZRGB> &sub_map)
+    {
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr local_map(new pcl::PointCloud<pcl::PointXYZRGB>);
+        if (img_l.empty() || depth_m.empty()) {
+            RCLCPP_WARN(mNode->get_logger(), "DenseMapper: empty image/depth for external depth path");
+            return;
+        }
+        cv::Mat img_l_rgb = img_l.clone();
+        cv::Mat depth;
+        if (depth_m.type() == CV_32FC1)
+            depth = depth_m;
+        else
+            depth_m.convertTo(depth, CV_32FC1);
+
+        if (depth.rows != img_l_rgb.rows || depth.cols != img_l_rgb.cols) {
+            cv::resize(depth, depth, img_l_rgb.size(), 0, 0, cv::INTER_NEAREST);
+        }
+
+        for (int y = 0; y < img_l_rgb.rows; y += 2) {
+            for (int x = 0; x < img_l_rgb.cols; x += 2) {
+                float z = depth.at<float>(y, x);
+                if (!(z > 0.05f) || z > 20.0f)
+                    continue;
+                unsigned char b, g, r;
+                if (img_l_rgb.channels() == 3) {
+                    b = img_l_rgb.at<cv::Vec3b>(y, x)[0];
+                    g = img_l_rgb.at<cv::Vec3b>(y, x)[1];
+                    r = img_l_rgb.at<cv::Vec3b>(y, x)[2];
+                } else {
+                    b = g = r = img_l_rgb.at<unsigned char>(y, x);
+                }
+                Eigen::Vector3d p_3d(0, 0, 0);
+                ProjectDepthTo3D(x, y, z, p_3d);
+                pcl::PointXYZRGB p(r, g, b);
+                p.x = p_3d.x();
+                p.y = p_3d.y();
+                p.z = p_3d.z();
+                local_map->push_back(p);
+            }
+        }
+        if (local_map->empty())
+            return;
+        pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> sorf;
+        sorf.setInputCloud(local_map);
+        sorf.setMeanK(mMeanK);
+        sorf.setStddevMulThresh(mStdThred);
+        sorf.filter(*local_map);
+        if (local_map->empty())
+            return;
+        pcl::VoxelGrid<pcl::PointXYZRGB> vgf;
+        vgf.setInputCloud(local_map);
+        vgf.setLeafSize(mLeafSize, mLeafSize, mLeafSize);
+        vgf.filter(sub_map);
+    }
+
+void DenseMapper::MergeSubMap(pcl::PointCloud<pcl::PointXYZRGB> &sub_map, KeyFrame* pKF)
     {
         pcl::PointCloud<pcl::PointXYZRGB> transformed_map;
 
@@ -395,7 +452,11 @@ namespace ORB_SLAM3
                     if (mKFWithPointCloud.find(pKF) == mKFWithPointCloud.end()) {
                         std::lock_guard<std::mutex> lock(mKFMutex);
                         mKFWithPointCloud[pKF] = pcl::PointCloud<pcl::PointXYZRGB>();
-                        GetSubMap(pKF->imgLeft, pKF->imgRight, mKFWithPointCloud[pKF]);
+                        if (!pKF->imgDepthScaled.empty()) {
+                            GetSubMapFromExternalDepth(pKF->imgLeft, pKF->imgDepthScaled, mKFWithPointCloud[pKF]);
+                        } else {
+                            GetSubMap(pKF->imgLeft, pKF->imgRight, mKFWithPointCloud[pKF]);
+                        }
                         MergeSubMap(mKFWithPointCloud[pKF], pKF);
                     }
                 }
@@ -450,6 +511,7 @@ namespace ORB_SLAM3
         pcl::toROSMsg(mGlobalMap, dense_map);
         dense_map.header.frame_id = "aqua_slam";
         mMapPub->publish(dense_map);
+        if (mMapAliasPub) mMapAliasPub->publish(dense_map);
         //	mMapPub->publish(mGlobalMap);
     }
 

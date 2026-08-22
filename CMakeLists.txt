@@ -77,6 +77,15 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 
 find_package(pcl_conversions REQUIRED)
+# Optional UW_SLAM bridge message for SuperPoint match injection
+find_package(uw_slam_bridge QUIET)
+if(uw_slam_bridge_FOUND)
+  message(STATUS "UW_SLAM: found uw_slam_bridge, enabling StereoMatches injection")
+  add_definitions(-DUW_SLAM_HAS_STEREO_MATCHES=1)
+  list(APPEND dependencies uw_slam_bridge)
+else()
+  message(STATUS "UW_SLAM: uw_slam_bridge not found; building without StereoMatches msg")
+endif()
 # find_package(pcl_ros REQUIRED)
 # -----------------------------------------------------------------------------
 
@@ -419,6 +428,10 @@ ament_target_dependencies(${PROJECT_NAME}_node
   pcl_conversions
 #   pcl_ros
 )
+if(uw_slam_bridge_FOUND)
+  ament_target_dependencies(${PROJECT_NAME}_node uw_slam_bridge)
+endif()
+
 # target_link_libraries(stereo_dvl2 ${Boost_LIBRARIES} ${PROJECT_NAME} ${PROJECT_NAME}_Optmization)  // original
 target_link_libraries(${PROJECT_NAME}_node
   ${PROJECT_NAME}
