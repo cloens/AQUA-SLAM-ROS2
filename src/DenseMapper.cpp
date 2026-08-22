@@ -355,7 +355,7 @@ namespace ORB_SLAM3
         //	sub_map = *local_map;
     }
 
-        void DenseMapper::GetSubMapFromExternalDepth(const Mat &img_l, const Mat &depth_m,
+    void DenseMapper::GetSubMapFromExternalDepth(const Mat &img_l, const Mat &depth_m,
                                                  pcl::PointCloud<pcl::PointXYZRGB> &sub_map)
     {
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr local_map(new pcl::PointCloud<pcl::PointXYZRGB>);
