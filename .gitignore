@@ -4,6 +4,7 @@ cmake_variables.txt
 build/
 install/
 log/
+bin/
 colcon_test_results/
 
 # ROS 1
@@ -49,4 +50,3 @@ cmake-build-release/
 Thumb.db
 *.bak
 *.swp
-

@@ -22,6 +22,7 @@
 #include "MapPoint.h"
 #include "KeyFrame.h"
 #include "ORBextractor.h"
+#include "SuperPointExtractor.h"
 #include "Converter.h"
 #include "ORBmatcher.h"
 #include "GeometricCamera.h"
@@ -47,6 +48,7 @@ float Frame::mfGridElementWidthInv, Frame::mfGridElementHeightInv;
 
 //For stereo fisheye matching
 cv::BFMatcher Frame::BFmatcher = cv::BFMatcher(cv::NORM_HAMMING);
+SuperPointExtractor* Frame::mpSharedSuperPoint = nullptr;
 
 Frame::Frame()
 	: mpcpi(NULL), mpImuPreintegrated(NULL), mpPrevFrame(NULL), mpImuPreintegratedFrame(NULL),
@@ -166,10 +168,13 @@ Frame::Frame(const cv::Mat &imLeft,
 #ifdef SAVE_TIMES
 	std::chrono::steady_clock::time_point time_StartExtORB = std::chrono::steady_clock::now();
 #endif
-	thread threadLeft(&Frame::ExtractORB, this, 0, imgLeftGray, 0, 0);
-	thread threadRight(&Frame::ExtractORB, this, 1, imgRightGray, 0, 0);
-	threadLeft.join();
-	threadRight.join();
+	const bool usedSP = ExtractSuperPointStereo(imgLeftGray, imgRightGray);
+	if (!usedSP) {
+		thread threadLeft(&Frame::ExtractORB, this, 0, imgLeftGray, 0, 0);
+		thread threadRight(&Frame::ExtractORB, this, 1, imgRightGray, 0, 0);
+		threadLeft.join();
+		threadRight.join();
+	}
 #ifdef SAVE_TIMES
 	std::chrono::steady_clock::time_point time_EndExtORB = std::chrono::steady_clock::now();
 
@@ -181,12 +186,13 @@ Frame::Frame(const cv::Mat &imLeft,
 		return;
 	}
 
-	UndistortKeyPoints();
-
 #ifdef SAVE_TIMES
 	std::chrono::steady_clock::time_point time_StartStereoMatches = std::chrono::steady_clock::now();
 #endif
-	ComputeStereoMatches();
+	if (!usedSP) {
+		UndistortKeyPoints();
+		ComputeStereoMatches();
+	}
 #ifdef SAVE_TIMES
 	std::chrono::steady_clock::time_point time_EndStereoMatches = std::chrono::steady_clock::now();
 
@@ -278,6 +284,53 @@ void Frame::AssignFeaturesToGrid()
 	}
 }
 
+void Frame::SetSharedSuperPoint(SuperPointExtractor* extractor)
+{
+    mpSharedSuperPoint = extractor;
+}
+
+bool Frame::ExtractSuperPointStereo(const cv::Mat &imLeftGray, const cv::Mat &imRightGray)
+{
+    if (!mpSharedSuperPoint || !mpSharedSuperPoint->Ready())
+        return false;
+    std::vector<cv::Point2f> matchLeft, matchRight;
+    std::vector<float> matchScore;
+    std::vector<int> leftToRight;
+    mpSharedSuperPoint->ExtractPair(imLeftGray, imRightGray,
+                                    mvKeys, mDescriptors,
+                                    mvKeysRight, mDescriptorsRight,
+                                    matchLeft, matchRight, matchScore, &leftToRight);
+    if (mvKeys.empty())
+        return false;
+
+    if (mpORBextractorLeft)
+        mpORBextractorLeft->BuildPyramid(imLeftGray);
+    if (mpORBextractorRight)
+        mpORBextractorRight->BuildPyramid(imRightGray);
+    N = (int)mvKeys.size();
+    static int logCounter = 0;
+    if ((logCounter++ % 15) == 0)
+        std::cout << "SuperPoint stereo N=" << N << " matches=" << matchLeft.size() << std::endl;
+
+    UndistortKeyPoints();
+    mvuRight = vector<float>(N, -1.0f);
+    mvDepth = vector<float>(N, -1.0f);
+    const int count = (int)std::min(leftToRight.size(), mvKeys.size());
+    for (int i = 0; i < count; ++i) {
+        const int j = leftToRight[i];
+        if (j < 0 || j >= (int)mvKeysRight.size())
+            continue;
+        const float uLeft = mvKeysUn.empty() ? mvKeys[i].pt.x : mvKeysUn[i].pt.x;
+        const float uRight = mvKeysRight[j].pt.x;
+        const float disparity = uLeft - uRight;
+        if (disparity <= 0.5f)
+            continue;
+        mvuRight[i] = uRight;
+        mvDepth[i] = mbf / disparity;
+    }
+    return true;
+}
+
 void Frame::ExtractORB(int flag, const cv::Mat &im, const int x0, const int x1)
 {
 	vector<int> vLapping = {x0, x1};
@@ -322,37 +375,39 @@ void Frame::SetVelocity(const cv::Mat &Vwb)
 
 void Frame::SetImuPoseVelocity(const cv::Mat &Rwb, const cv::Mat &twb, const cv::Mat &Vwb)
 {
-	std::lock_guard<std::mutex> lock(*mpExtrinsic_mutex);
-	mVw = Vwb.clone();
-	cv::Mat Rbw = Rwb.t();
-	cv::Mat tbw = -Rbw * twb;
-	cv::Mat Tbw = cv::Mat::eye(4, 4, CV_32F);
-	Rbw.copyTo(Tbw.rowRange(0, 3).colRange(0, 3));
-	tbw.copyTo(Tbw.rowRange(0, 3).col(3));
-	mTcw = mImuCalib.Tcb * Tbw;
-	mT_c0_cj_dvl = Eigen::Isometry3d::Identity();
-	cv::cv2eigen(mTcw, mT_c0_cj_dvl.matrix());
-
+	{
+		std::lock_guard<std::mutex> lock(*mpExtrinsic_mutex);
+		mVw = Vwb.clone();
+		cv::Mat Rbw = Rwb.t();
+		cv::Mat tbw = -Rbw * twb;
+		cv::Mat Tbw = cv::Mat::eye(4, 4, CV_32F);
+		Rbw.copyTo(Tbw.rowRange(0, 3).colRange(0, 3));
+		tbw.copyTo(Tbw.rowRange(0, 3).col(3));
+		mTcw = mImuCalib.Tcb * Tbw;
+		mT_c0_cj_dvl = Eigen::Isometry3d::Identity();
+		cv::cv2eigen(mTcw, mT_c0_cj_dvl.matrix());
+	}
 	UpdatePoseMatrices();
 }
 
 void Frame::SetDvlPoseVelocity(const cv::Mat &R_c0_gyroj, const cv::Mat &c0_t_c0_dj, const cv::Mat &c0_V_di_dj)
 {
-	std::lock_guard<std::mutex> lock(*mpExtrinsic_mutex);
-	cv::Mat R_c0_dj;
-	cv::Mat R_imu_dvl;
-	R_imu_dvl = mImuCalib.mT_imu_dvl.rowRange(0, 3).colRange(0, 3).clone();
-	R_c0_dj = R_c0_gyroj * R_imu_dvl;
-	mVw = c0_V_di_dj.clone();
-	cv::Mat R_dj_c0 = R_c0_dj.t();
-	cv::Mat dj_t_dj_c0 = -R_dj_c0 * c0_t_c0_dj;
-	cv::Mat T_dj_c0 = cv::Mat::eye(4, 4, CV_32F);
-	R_dj_c0.copyTo(T_dj_c0.rowRange(0, 3).colRange(0, 3));
-	dj_t_dj_c0.copyTo(T_dj_c0.rowRange(0, 3).col(3));
-	mTcw = mImuCalib.mT_c_dvl * T_dj_c0;
-	mT_c0_cj_dvl = Eigen::Isometry3d::Identity();
-	cv::cv2eigen(mTcw, mT_c0_cj_dvl.matrix());
-
+	{
+		std::lock_guard<std::mutex> lock(*mpExtrinsic_mutex);
+		cv::Mat R_c0_dj;
+		cv::Mat R_imu_dvl;
+		R_imu_dvl = mImuCalib.mT_imu_dvl.rowRange(0, 3).colRange(0, 3).clone();
+		R_c0_dj = R_c0_gyroj * R_imu_dvl;
+		mVw = c0_V_di_dj.clone();
+		cv::Mat R_dj_c0 = R_c0_dj.t();
+		cv::Mat dj_t_dj_c0 = -R_dj_c0 * c0_t_c0_dj;
+		cv::Mat T_dj_c0 = cv::Mat::eye(4, 4, CV_32F);
+		R_dj_c0.copyTo(T_dj_c0.rowRange(0, 3).colRange(0, 3));
+		dj_t_dj_c0.copyTo(T_dj_c0.rowRange(0, 3).col(3));
+		mTcw = mImuCalib.mT_c_dvl * T_dj_c0;
+		mT_c0_cj_dvl = Eigen::Isometry3d::Identity();
+		cv::cv2eigen(mTcw, mT_c0_cj_dvl.matrix());
+	}
 	UpdatePoseMatrices();
 }
 

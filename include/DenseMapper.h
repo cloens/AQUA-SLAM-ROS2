@@ -141,7 +141,7 @@ public:
 	float mStdThred;
 
 public:
-	void InsertNewKF(KeyFrame *pKF);
+	void InsertNewKF(KeyFrame *pKF, bool retain_images_when_disabled = false);
 	void Update();
 
 	void PublishMap();

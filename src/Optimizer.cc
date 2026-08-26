@@ -573,6 +573,9 @@ void Optimizer::FullInertialBA(Map *pMap,
 				continue;
 			}
 			if (pKFi->bImu && pKFi->mPrevKF->bImu) {
+				if (!pKFi->mpImuPreintegrated) {
+					continue;
+				}
 				pKFi->mpImuPreintegrated->SetNewBias(pKFi->mPrevKF->GetImuBias());
 				g2o::HyperGraph::Vertex *VP1 = optimizer.vertex(pKFi->mPrevKF->mnId);
 				g2o::HyperGraph::Vertex *VV1 = optimizer.vertex(maxKFid + 3 * (pKFi->mPrevKF->mnId) + 1);
@@ -8081,6 +8084,7 @@ void Optimizer::InertialOptimization(Map *pMap,
 			}
 			if (!pKFi->mpImuPreintegrated) {
 				std::cout << "Not preintegrated measurement" << std::endl;
+				continue;
 			}
 
 			pKFi->mpImuPreintegrated->SetNewBias(pKFi->mPrevKF->GetImuBias());
@@ -8146,26 +8150,26 @@ void Optimizer::InertialOptimization(Map *pMap,
 	std::cout << "update Keyframes velocities and biases" << std::endl;
 
 	const int N = vpKFs.size();
-	for (size_t i = 0; i < N; i++) {
-		KeyFrame *pKFi = vpKFs[i];
-		if (pKFi->mnId > maxKFid) {
-			continue;
-		}
+		for (size_t i = 0; i < N; i++) {
+			KeyFrame *pKFi = vpKFs[i];
+			if (pKFi->mnId > maxKFid) {
+				continue;
+			}
 
-		VertexVelocity *VV = static_cast<VertexVelocity *>(optimizer.vertex(maxKFid + (pKFi->mnId) + 1));
-		Eigen::Vector3d Vw = VV->estimate(); // Velocity is scaled after
-		pKFi->SetVelocity(Converter::toCvMat(Vw));
+			VertexVelocity *VV = static_cast<VertexVelocity *>(optimizer.vertex(maxKFid + (pKFi->mnId) + 1));
+			Eigen::Vector3d Vw = VV->estimate(); // Velocity is scaled after
+			pKFi->SetVelocity(Converter::toCvMat(Vw));
 
-		if (cv::norm(pKFi->GetGyroBias() - cvbg) > 0.01) {
-			pKFi->SetNewBias(b);
-			if (pKFi->mpImuPreintegrated) {
-				pKFi->mpImuPreintegrated->Reintegrate();
+			if (cv::norm(pKFi->GetGyroBias() - cvbg) > 0.01) {
+				pKFi->SetNewBias(b);
+				if (pKFi->mpImuPreintegrated) {
+					pKFi->mpImuPreintegrated->Reintegrate();
+				}
+			}
+			else {
+				pKFi->SetNewBias(b);
 			}
 		}
-		else {
-			pKFi->SetNewBias(b);
-		}
-	}
 }
 
 void Optimizer::InertialOptimization(Map *pMap, Eigen::Vector3d &bg, Eigen::Vector3d &ba, float priorG, float priorA)
@@ -8250,6 +8254,9 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Vector3d &bg, Eigen::Vect
 
 		if (pKFi->mPrevKF && pKFi->mnId <= maxKFid) {
 			if (pKFi->isBad() || pKFi->mPrevKF->mnId > maxKFid) {
+				continue;
+			}
+			if (!pKFi->mpImuPreintegrated) {
 				continue;
 			}
 
@@ -8411,6 +8418,9 @@ void Optimizer::InertialOptimization(vector<KeyFrame *> vpKFs,
 
 		if (pKFi->mPrevKF && pKFi->mnId <= maxKFid) {
 			if (pKFi->isBad() || pKFi->mPrevKF->mnId > maxKFid) {
+				continue;
+			}
+			if (!pKFi->mpImuPreintegrated) {
 				continue;
 			}
 

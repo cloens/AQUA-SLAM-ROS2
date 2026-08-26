@@ -17,6 +17,7 @@
 */
 
 #include "ImuTypes.h"
+#include <cmath>
 #include<iostream>
 
 namespace ORB_SLAM3
@@ -167,6 +168,31 @@ cv::Mat InverseRightJacobianSO3(const cv::Mat &v)
 }
 
 
+IntegratedRotation::IntegratedRotation(const cv::Point3f &angVel, const Bias &imuBias, const float &time):
+    deltaT(time)
+{
+    const float x = (angVel.x-imuBias.bwx)*time;
+    const float y = (angVel.y-imuBias.bwy)*time;
+    const float z = (angVel.z-imuBias.bwz)*time;
+
+    cv::Mat I = cv::Mat::eye(3,3,CV_32F);
+    const float d2 = x*x+y*y+z*z;
+    const float d = sqrt(d2);
+    cv::Mat W = (cv::Mat_<float>(3,3) << 0, -z, y,
+                 z, 0, -x,
+                 -y, x, 0);
+    if(d<eps)
+    {
+        deltaR = I + W;
+        rightJ = cv::Mat::eye(3,3,CV_32F);
+    }
+    else
+    {
+        deltaR = I + W*sin(d)/d + W*W*(1.0f-cos(d))/d2;
+        rightJ = I - W*(1.0f-cos(d))/d2 + W*W*(d-sin(d))/(d2*d);
+    }
+}
+
 IntegratedRotation::IntegratedRotation(const cv::Point3d &angVel, const Bias &imuBias, const double &time):
     deltaT(time)
 {
@@ -273,6 +299,12 @@ void Preintegrated::Reintegrate()
 
 void Preintegrated::IntegrateNewMeasurement(const cv::Point3f &acceleration, const cv::Point3f &angVel, const float &dt)
 {
+	if (!std::isfinite(dt) || dt <= 0.0F ||
+	    !std::isfinite(acceleration.x) || !std::isfinite(acceleration.y) ||
+	    !std::isfinite(acceleration.z) || !std::isfinite(angVel.x) ||
+	    !std::isfinite(angVel.y) || !std::isfinite(angVel.z)) {
+		return;
+	}
     mvMeasurements.push_back(integrable(acceleration,angVel,dt));
 
     // Position is updated firstly, as it depends on previously computed velocity and rotation.

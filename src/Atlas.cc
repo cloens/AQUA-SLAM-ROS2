@@ -306,8 +306,7 @@ void Atlas::SetImuInitialized()
 bool Atlas::isImuInitialized()
 {
     unique_lock<mutex> lock(mMutexAtlas);
-    auto it = *mspMaps.begin();
-    return it->isImuInitialized();
+    return mpCurrentMap && mpCurrentMap->isImuInitialized();
 }
 
 void Atlas::PreSave()

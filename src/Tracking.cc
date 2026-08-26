@@ -18,6 +18,7 @@
 
 
 #include "Tracking.h"
+#include "SuperPointExtractor.h"
 
 #include<opencv2/core/core.hpp>
 #include<opencv2/features2d/features2d.hpp>
@@ -107,7 +108,6 @@ Tracking::Tracking(System *pSys,
 	initID = 0;
 	lastID = 0;
 
-	ParseIMUParamFile(fSettings);
 	// Load IMU parameters
 	bool b_parse_imu = true;
 	if (sensor == System::IMU_MONOCULAR || sensor == System::IMU_STEREO || sensor == System::DVL_STEREO) {
@@ -118,26 +118,22 @@ Tracking::Tracking(System *pSys,
 
 		mnFramesToResetIMU = mMaxFrames;
 	}
+	if (sensor == System::IMU_STEREO || sensor == System::DVL_STEREO) {
+		mKF_init_step = (double)fSettings["Optimizer.KF_init_step"];
+		mKF_num_for_init = fSettings["Optimizer.KF_num_for_init"];
+		mCalibrated = ((double)fSettings["Optimizer.calibrated"]) == 1;
+		mInitialized = sensor != System::DVL_STEREO;
+		mKFThresholdForMap = (int)fSettings["Tracker.KFThresholdForMap"];
+		time_recently_lost = (double)fSettings["Tracker.ReLocalTime"];
+		mDetectLoop = ((int)fSettings["EnableLoopDetection"]) == 1;
+		mVisualIntegration = ((int)fSettings["VisualIntegration"]) == 1;
+	}
 	// Load Optimizer parameters
 	if (sensor == System::DVL_STEREO) {
 		mlamda_visual = fSettings["Optimizer.visual_lamda"];
 		mlamda_DVL = fSettings["Optimizer.DVL_lamda"];
 		mlamda_DVL_debug = fSettings["Optimizer.DVL_lamda_debug"];
 		mDVL_func_debug = fSettings["Optimizer.DVL_func"];
-		mKF_init_step = (double)fSettings["Optimizer.KF_init_step"];
-		mKF_num_for_init = fSettings["Optimizer.KF_num_for_init"];
-		double dCalibrated;
-		dCalibrated = fSettings["Optimizer.calibrated"];
-		mCalibrated = dCalibrated == 1;
-        mInitialized = false;
-		mKFThresholdForMap = (int)fSettings["Tracker.KFThresholdForMap"];
-		time_recently_lost = (double)fSettings["Tracker.ReLocalTime"];
-		mDetectLoop = ((int)fSettings["EnableLoopDetection"]) == 1;
-
-		int visualIntegration;
-		visualIntegration = (int)fSettings["VisualIntegration"];
-		mVisualIntegration = visualIntegration == 1;
-
 		cout << "Optimizer.visual_lamda: " << mlamda_visual << endl;
 		cout << "Optimizer.DVL_lamda: " << mlamda_DVL << endl;
 		cout << "Optimizer.DVL_lamda_debug: " << mlamda_DVL_debug << endl;
@@ -737,6 +733,22 @@ bool Tracking::ParseORBParamFile(cv::FileStorage &fSettings)
 	}
 
 	mpORBextractorLeft = new ORBextractor(nFeatures, fScaleFactor, nLevels, fIniThFAST, fMinThFAST);
+	{
+		std::string spPath;
+		cv::FileNode spNode = fSettings["SuperPoint.onnx"];
+		if (!spNode.empty())
+			spPath = (std::string)spNode;
+		if (spPath.empty())
+			spPath = "/home/leong/leon_ws/AQUA-SLAM-ROS2/models/superpoint_v1.onnx";
+		const int spInputWidth = (int)fSettings["SuperPoint.input_width"].real();
+		const int spInputHeight = (int)fSettings["SuperPoint.input_height"].real();
+		const cv::Size spInputSize = spInputWidth > 0 && spInputHeight > 0
+			? cv::Size(spInputWidth, spInputHeight) : cv::Size();
+		static SuperPointExtractor sSuperPoint(spPath, nFeatures, 0.005f, 3, spInputSize);
+		Frame::SetSharedSuperPoint(&sSuperPoint);
+		if (sSuperPoint.Ready())
+			std::cout << "Front-end extractor: SuperPoint (ORB fallback disabled when SuperPoint ready)" << std::endl;
+	}
 
 	if (mSensor == System::STEREO || mSensor == System::IMU_STEREO || mSensor == System::DVL_STEREO) {
 		mpORBextractorRight = new ORBextractor(nFeatures, fScaleFactor, nLevels, fIniThFAST, fMinThFAST);
@@ -838,7 +850,7 @@ bool Tracking::ParseIMUParamFile(cv::FileStorage &fSettings)
 	cv::cv2eigen(beta, beta_e);
 	SetBeamOrientation(alpha_e, beta_e);
 
-	cout << "Left camera to Imu Transform (Tbc): " << endl << Tbc << endl;
+	cout << "Camera to IMU Transform (T_imu_c): " << endl << T_imu_c << endl;
 
 	float freq, Ng, Na, Ngw, Naw;
 
@@ -995,7 +1007,7 @@ cv::Mat Tracking::GrabImageStereoDvl(const cv::Mat &imRectLeft,
 //	}
 
 
-	if (mSensor == System::DVL_STEREO && !mpCamera2) {
+	if ((mSensor == System::DVL_STEREO || mSensor == System::IMU_STEREO) && !mpCamera2) {
 		// EKF DVL
 		//mCurrentFrame = Frame(mImGray, imGrayRight, timestamp, mpORBextractorLeft, mpORBextractorRight, mpORBVocabulary, mK, mDistCoef, mbf, mThDepth, mpCamera, mCurT_e0_ej, mCurTimeEKF, mGood_EKF, mT_e_c, mT_g_e, mCurT_g0_gj, mV_e);
 		// tighly coupled DVL
@@ -1075,7 +1087,7 @@ cv::Mat Tracking::GrabImageStereoDvlgyro(const Mat &imRectLeft,
 	cv::resize(imGrayRight, imGrayRight, cv::Size(imGrayRight.cols * mImageScale, imGrayRight.rows * mImageScale));
 	cv::resize(mImRight, mImRight, cv::Size(mImRight.cols * mImageScale, mImRight.rows * mImageScale));
 
-	if (mSensor == System::DVL_STEREO && !mpCamera2) {
+	if ((mSensor == System::DVL_STEREO || mSensor == System::IMU_STEREO) && !mpCamera2) {
 		// EKF DVL
 		//mCurrentFrame = Frame(mImGray, imGrayRight, timestamp, mpORBextractorLeft, mpORBextractorRight, mpORBVocabulary, mK, mDistCoef, mbf, mThDepth, mpCamera, mCurT_e0_ej, mCurTimeEKF, mGood_EKF, mT_e_c, mT_g_e, mCurT_g0_gj, mV_e);
 		// tighly coupled DVL
@@ -1111,7 +1123,10 @@ cv::Mat Tracking::GrabImageStereoDvlgyro(const Mat &imRectLeft,
 mCurrentFrame.mNameFile = filename;
 	mCurrentFrame.mnDataset = mnNumDataset;
 
-	TrackDVLGyro();
+	if (mSensor == System::IMU_STEREO)
+		Track();
+	else
+		TrackDVLGyro();
 
 	return mCurrentFrame.mTcw.clone();
 }
@@ -3506,7 +3521,14 @@ void Tracking::TrackKLT()
 void Tracking::StereoInitialization()
 {
 //     ROS_INFO_STREAM("try to initialize");  // original
-	if (mCurrentFrame.N > 500) {
+	int nDepth = 0;
+	for (int i = 0; i < mCurrentFrame.N; ++i) {
+		if (mCurrentFrame.mvDepth[i] > 0)
+			++nDepth;
+	}
+	RCLCPP_DEBUG(rclcpp::get_logger("aqua_slam"),
+	             "StereoInit attempt N=%d depthValid=%d", mCurrentFrame.N, nDepth);
+	if (mCurrentFrame.N > 40 && nDepth > 20) {
 		if (mSensor == System::DVL_STEREO) {
             if (mpIntegrator->GetDoLossIntegration()) {
                 PredictStateDvlGro();
@@ -3548,7 +3570,9 @@ void Tracking::StereoInitialization()
         if (mpLastKeyFrame) {
             pKFini->mPrevKF = mpLastKeyFrame;
             mpLastKeyFrame->mNextKF = pKFini;
-            pKFini->SetNewBias(pKFini->mpDvlPreintegrationKeyFrame->mb);
+            if (mSensor == System::DVL_STEREO && pKFini->mpDvlPreintegrationKeyFrame) {
+                pKFini->SetNewBias(pKFini->mpDvlPreintegrationKeyFrame->mb);
+            }
         }
         // else: first init or re-init after map reset — no prev KF to link
 
@@ -3619,6 +3643,9 @@ void Tracking::StereoInitialization()
 		// mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.mTcw);
 
 		mState = OK;
+		RCLCPP_INFO(rclcpp::get_logger("aqua_slam"),
+		            "StereoInit SUCCESS: KF=%lu mapPoints=%zu depthValid=%d",
+		            pKFini->mnId, mpAtlas->MapPointsInMap(), nDepth);
 
         if(mpIntegrator->GetDoLossIntegration()){
             std::unique_lock<std::shared_mutex> lock(mLossKFMutex);
@@ -4033,9 +4060,7 @@ void Tracking::CreateMapInAtlas()
 
 	}
 
-	// if (mpLastKeyFrame) {
-	// 	mpLastKeyFrame = static_cast<KeyFrame *>(NULL);
-	// }
+	mpLastKeyFrame = static_cast<KeyFrame *>(NULL);
 
 	if (mpReferenceKF) {
 		mpReferenceKF = static_cast<KeyFrame *>(NULL);
@@ -4078,7 +4103,17 @@ bool Tracking::TrackReferenceKeyFrame()
 	int nmatches = matcher.SearchByBoW(mpReferenceKF, mCurrentFrame, vpMapPointMatches);
 
 	if (nmatches < 15) {
-//        cout << "TRACK_REF_KF: Less than 15 matches!!\n";
+		RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+		            "TrackReferenceKeyFrame rejected: frame=%lu dt=%.6f features=%d "
+		            "descriptors=%dx%d type=%d bow_matches=%d reference_kf=%lu",
+		            mCurrentFrame.mnId,
+		            mCurrentFrame.mTimeStamp - mLastFrame.mTimeStamp,
+		            mCurrentFrame.N,
+		            mCurrentFrame.mDescriptors.rows,
+		            mCurrentFrame.mDescriptors.cols,
+		            mCurrentFrame.mDescriptors.type(),
+		            nmatches,
+		            mpReferenceKF ? mpReferenceKF->mnId : 0);
 		return false;
 	}
 
@@ -4090,7 +4125,7 @@ bool Tracking::TrackReferenceKeyFrame()
 
 
 	// cout << " TrackReferenceKeyFrame mLastFrame.mTcw:  " << mLastFrame.mTcw << endl;
-	Optimizer::PoseOptimization(&mCurrentFrame);
+	const int poseInliers = Optimizer::PoseOptimization(&mCurrentFrame);
 
 	// Discard outliers
 	int nmatchesMap = 0;
@@ -4116,6 +4151,18 @@ bool Tracking::TrackReferenceKeyFrame()
 				nmatchesMap++;
 			}
 		}
+	}
+
+	if (nmatchesMap < 10) {
+		RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+		            "TrackReferenceKeyFrame weak result: frame=%lu dt=%.6f "
+		            "bow_matches=%d pose_inliers=%d map_matches=%d reference_kf=%lu",
+		            mCurrentFrame.mnId,
+		            mCurrentFrame.mTimeStamp - mLastFrame.mTimeStamp,
+		            nmatches,
+		            poseInliers,
+		            nmatchesMap,
+		            mpReferenceKF ? mpReferenceKF->mnId : 0);
 	}
 
 	// TODO check these conditions
@@ -5034,6 +5081,11 @@ bool Tracking::TrackLocalMap()
 
 	// add all keyframes share the map points in current frame and their neighbors to mvpLocalKeyFrames
 	// add all map points in mvpLocalKeyFrames to mvpLocalMapPoints
+	int associationsBeforeLocalMap = 0;
+	for (MapPoint *pMP : mCurrentFrame.mvpMapPoints) {
+		if (pMP)
+			++associationsBeforeLocalMap;
+	}
 	UpdateLocalMap();
 	// add more map points in local map to mCurrentFrame.mvpMapPoints
 	SearchLocalPoints();
@@ -5048,8 +5100,7 @@ bool Tracking::TrackLocalMap()
 			}
 		}
 
-	int inliers;
-	Optimizer::PoseOptimization(&mCurrentFrame);
+	const int poseInliers = Optimizer::PoseOptimization(&mCurrentFrame);
 //	if (!mpAtlas->isImuInitialized()) {
 //		Optimizer::PoseOptimization(&mCurrentFrame);
 //	}
@@ -5123,8 +5174,21 @@ bool Tracking::TrackLocalMap()
     // if(mnMatchesInliers<20){
     //     PredictStateDvlGro();
     // }
-    if (mnMatchesInliers < 10) {
-        return false;
+	if (mnMatchesInliers < 10) {
+		RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+		            "TrackLocalMap rejected: frame=%lu dt=%.6f features=%d "
+		            "associations_before=%d associations_after=%d pose_inliers=%d "
+		            "map_inliers=%d local_keyframes=%zu local_points=%zu",
+		            mCurrentFrame.mnId,
+		            mCurrentFrame.mTimeStamp - mLastFrame.mTimeStamp,
+		            mCurrentFrame.N,
+		            associationsBeforeLocalMap,
+		            aux1,
+		            poseInliers,
+		            mnMatchesInliers,
+		            mvpLocalKeyFrames.size(),
+		            mvpLocalMapPoints.size());
+		return false;
     }
     else {
         return true;
@@ -5253,10 +5317,11 @@ bool Tracking::TrackLocalMapWithDvlGyro()
 
 bool Tracking::NeedNewKeyFrame()
 {
+	const bool sensorReady = mSensor != System::DVL_STEREO || mCurrentFrame.mbDVL;
 
 	if (!mCalibrated) {
 		if (mCurrentFrame.mTimeStamp - mpLastKeyFrame->mTimeStamp >= mKF_init_step
-			&& mCurrentFrame.mbDVL) {
+			&& sensorReady) {
 			return true;
 		}
 		else{
@@ -5265,7 +5330,7 @@ bool Tracking::NeedNewKeyFrame()
 	}
     else if (!mInitialized) {
         if (mCurrentFrame.mTimeStamp - mpLastKeyFrame->mTimeStamp >= mKF_init_step
-            && mCurrentFrame.mbDVL) {
+            && sensorReady) {
             return true;
         }
         else{
@@ -5615,7 +5680,7 @@ void Tracking::CreateNewKeyFrameKLT()
 	}
 	KeyFrame *pKF = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
 
-	mpDenseMapper->InsertNewKF(pKF);
+	mpDenseMapper->InsertNewKF(pKF, true);
 
 
 	if (mpAtlas->isImuInitialized()) {
@@ -6266,6 +6331,9 @@ void Tracking::ResetActiveMap(bool bLocMap)
 	clear_thread.join();
 	mpAtlas->clearMap(pMapToReset);
 //	mpAtlas->clearSmallMaps();
+	// The cleared map owns the previous keyframe. A re-initialized stereo map
+	// must not link its first keyframe to that deleted object.
+	mpLastKeyFrame = static_cast<KeyFrame *>(NULL);
 
 	//KeyFrame::nNextId = mpAtlas->GetLastInitKFid();
 	//Frame::nNextId = mnLastInitFrameId;
@@ -6416,8 +6484,10 @@ void Tracking::UpdateFrameIMU(const float s, const IMU::Bias &b, KeyFrame *pCurr
 	cv::Mat Vwb1;
 	float t12;
 
-	while (!mCurrentFrame.imuIsPreintegrated()) {
-		usleep(500);
+	// Local Mapping cannot complete the tracker-owned preintegration. Waiting
+	// here can deadlock the whole IMU_STEREO pipeline during initialization.
+	if (!mCurrentFrame.imuIsPreintegrated()) {
+		return;
 	}
 
 

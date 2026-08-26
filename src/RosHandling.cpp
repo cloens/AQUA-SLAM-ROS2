@@ -10,10 +10,34 @@
 #include "LocalMapping.h"
 // #include "visualization_msgs/Marker.h"  // original
 #include <visualization_msgs/msg/marker.hpp>
+#include <chrono>
+#include <cmath>
 #include <fstream>
+#include <thread>
 
 using namespace ORB_SLAM3;
 using namespace std;
+
+namespace {
+
+bool IsFiniteTransform(const Eigen::Isometry3d &transform)
+{
+    return transform.matrix().allFinite();
+}
+
+bool IsFiniteVelocity(const cv::Mat &velocity)
+{
+    if (velocity.empty() || velocity.rows != 3) {
+        return false;
+    }
+    cv::Mat velocity_f;
+    velocity.convertTo(velocity_f, CV_32F);
+    return std::isfinite(velocity_f.at<float>(0)) &&
+           std::isfinite(velocity_f.at<float>(1)) &&
+           std::isfinite(velocity_f.at<float>(2));
+}
+
+}  // namespace
 
 // RosHandling::RosHandling(System *pSys, LocalMapping *pLocal)  // original
 // 	: mp_system(pSys),mp_LocalMapping(pLocal)  // original
@@ -255,6 +279,12 @@ void RosHandling::PublishOrb(const Eigen::Isometry3d &T_c0_cj_orb,
     T_c_rviz.rotate(r_y);
 
     Eigen::Isometry3d T_w_cj = mT_w_c0 * T_c0_cj_orb;
+    if (!IsFiniteTransform(T_w_cj)) {
+        RCLCPP_WARN_THROTTLE(
+            mp_node->get_logger(), *mp_node->get_clock(), 5000,
+            "Dropping invalid estimator pose before ROS publication");
+        return;
+    }
 
     geometry_msgs::msg::PoseStamped pose_to_pub;
     pose_to_pub.header.frame_id = "aqua_slam";
@@ -270,17 +300,12 @@ void RosHandling::PublishOrb(const Eigen::Isometry3d &T_c0_cj_orb,
     mp_pose_orb_pub->publish(pose_to_pub);
     if (mp_pose_alias_pub) mp_pose_alias_pub->publish(pose_to_pub);
 
-    m_path_orb.header = pose_to_pub.header;
-    m_path_orb.poses.push_back(pose_to_pub);
-    mp_path_orb_pub->publish(m_path_orb);
-    if (mp_path_alias_pub) mp_path_alias_pub->publish(m_path_orb);
-
     Eigen::Isometry3d T_w_rviz = T_w_cj * T_c_rviz;
     BroadcastTF(T_w_rviz, "aqua_slam", "bluerov/base_link");
     nav_msgs::msg::Odometry odom;
     odom.header = pose_to_pub.header;
     odom.pose.pose = pose_to_pub.pose;
-    if (!Vwb.empty() && Vwb.rows == 3) {
+    if (IsFiniteVelocity(Vwb)) {
         // Vwb: velocity of body expressed in world frame (from IMU propagation / g2o BA)
         cv::Mat Vwb_f;
         Vwb.convertTo(Vwb_f, CV_32F);
@@ -304,7 +329,13 @@ void RosHandling::PublishOrb(const Eigen::Isometry3d &T_c0_cj_orb,
         odom_body.pose.pose.orientation.y = q_body.y();
         odom_body.pose.pose.orientation.z = q_body.z();
         odom_body.pose.pose.orientation.w = q_body.w();
-        if (!Vwb.empty() && Vwb.rows == 3) {
+        if (!IsFiniteTransform(T_w_bj)) {
+            RCLCPP_WARN_THROTTLE(
+                mp_node->get_logger(), *mp_node->get_clock(), 5000,
+                "Dropping invalid estimator body pose before ROS publication");
+            return;
+        }
+        if (IsFiniteVelocity(Vwb)) {
             cv::Mat Vwb_f;
             Vwb.convertTo(Vwb_f, CV_32F);
             Eigen::Vector3d v_w(Vwb_f.at<float>(0), Vwb_f.at<float>(1), Vwb_f.at<float>(2));
@@ -376,9 +407,9 @@ void RosHandling::UpdateMap(ORB_SLAM3::Atlas *pAtlas)
 		const vector<MapPoint *> &vpMPs = pMap->GetAllMapPoints();
 		const Eigen::Vector3d &color = pMap->mColor * 255;
 
-		if (vpMPs.empty()) {
-			return;
-		}
+			if (vpMPs.empty()) {
+				continue;
+			}
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud, free_cloud;
         cloud = pcl::PointCloud<pcl::PointXYZRGB>::Ptr(new pcl::PointCloud<pcl::PointXYZRGB>);
         cloud->reserve(50000);
@@ -754,6 +785,8 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
                 m_ref_integration_path.header = pose_to_pub.header;
             }
 
+            geometry_msgs::msg::PoseStamped pose_to_pub;
+            if (pKF->mpDvlPreintegrationKeyFrame) {
             cv::Mat R_gi_gj_cv = pKF->mpDvlPreintegrationKeyFrame->GetDeltaRotation(pKF->GetImuBias());
             cv::Mat t_di_dj_cv = pKF->mpDvlPreintegrationKeyFrame->GetDVLPosition(pKF->GetImuBias());
             R_gi_gj_cv.convertTo(R_gi_gj_cv, CV_32F);
@@ -773,7 +806,6 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
             Eigen::Isometry3d T_w_cj_integration = T_w_c0 * T_d_c.inverse() * T_d0_dj * T_d_c;
             poses_integration.push_back(T_w_cj_integration);
 
-            geometry_msgs::msg::PoseStamped pose_to_pub;
             pose_to_pub.header.frame_id = "aqua_slam";
             pose_to_pub.header.stamp = rclcpp::Time(static_cast<int64_t>(pKF->mTimeStamp * 1e9));
 // //             //pose_to_pub.header.stamp=ros::Time::now();  // original  // original
@@ -793,6 +825,7 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
 
             m_integration_path.header = pose_to_pub.header;
             m_integration_path.poses.push_back(pose_to_pub);
+            }
 
 
             cv::Mat T_c0_cj_orb_cv = pKF->GetPoseInverse();
@@ -811,7 +844,7 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
             // rotation_matrix<< R.at<float>(0, 0), R.at<float>(0, 1), R.at<float>(0, 2),
             // R.at<float>(1, 0), R.at<float>(1, 1), R.at<float>(1, 2),
             // R.at<float>(2, 0), R.at<float>(2, 1), R.at<float>(2, 2);
-            rotation_q = Eigen::Quaterniond(T_w_cj_orb.rotation());
+            Eigen::Quaterniond rotation_q(T_w_cj_orb.rotation());
             pose_to_pub.pose.orientation.x = rotation_q.x();
             pose_to_pub.pose.orientation.y = rotation_q.y();
             pose_to_pub.pose.orientation.z = rotation_q.z();
@@ -855,6 +888,12 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
 		Eigen::Isometry3d T_c0_cj = Eigen::Isometry3d::Identity();
 		cv::cv2eigen(T_c0_cj_cv,T_c0_cj.matrix());
 		Eigen::Isometry3d T_w_cj = mT_w_c0 * T_c0_cj;
+		if (!IsFiniteTransform(T_w_cj)) {
+			RCLCPP_WARN_THROTTLE(
+				mp_node->get_logger(), *mp_node->get_clock(), 5000,
+				"Skipping invalid estimator keyframe while building trajectory");
+			continue;
+		}
 		geometry_msgs::msg::PoseStamped pose_to_pub;
 		pose_to_pub.header.frame_id = "aqua_slam";
 		pose_to_pub.header.stamp = rclcpp::Time(static_cast<int64_t>(pKF->mTimeStamp * 1e9));
@@ -874,6 +913,12 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
 
 		if (!mb_calib_initialized) continue;
 		Eigen::Isometry3d T_w_bj = T_w_cj * mT_imu_c.inverse() * mT_body_imu.inverse();
+		if (!IsFiniteTransform(T_w_bj)) {
+			RCLCPP_WARN_THROTTLE(
+				mp_node->get_logger(), *mp_node->get_clock(), 5000,
+				"Skipping invalid estimator body keyframe while building trajectory");
+			continue;
+		}
 		geometry_msgs::msg::PoseStamped body_pose;
 		body_pose.header = pose_to_pub.header;
 		Eigen::Quaterniond q_bj(T_w_bj.rotation());
@@ -1078,11 +1123,12 @@ void RosHandling::FullBA(std::shared_ptr<std_srvs::srv::Empty::Request> req, std
 
 void RosHandling::Run(Atlas* pAtlas)
 {
-    while(1){
+    constexpr auto publish_period = std::chrono::seconds(1);
+    auto next_publish = std::chrono::steady_clock::now();
+    while (1) {
         UpdateMap(pAtlas);
         PublishIntegration(pAtlas);
-        //sleep for 0.25 second
-        usleep(250000);
+        next_publish += publish_period;
+        std::this_thread::sleep_until(next_publish);
     }
-
 }

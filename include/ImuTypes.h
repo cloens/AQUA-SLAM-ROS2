@@ -392,6 +392,7 @@ class IntegratedRotation
 public:
 	IntegratedRotation()
 	{}
+	IntegratedRotation(const cv::Point3f &angVel, const Bias &imuBias, const float &time);
 	IntegratedRotation(const cv::Point3d &angVel, const Bias &imuBias, const double &time);
 
 public:

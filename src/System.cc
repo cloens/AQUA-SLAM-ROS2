@@ -469,6 +469,43 @@ cv::Mat System::TrackStereoGroDVL(const Mat &imLeft,
     return Tcw;
 
 }
+cv::Mat System::TrackStereoImu(const cv::Mat &imLeft,
+                               const cv::Mat &imRight,
+                               const double &timestamp,
+                               const vector<IMU::ImuPoint> &vImuMeas,
+                               string filename,
+                               const std::vector<cv::Point2f>& vExtLeft,
+                               const std::vector<cv::Point2f>& vExtRight,
+                               const std::vector<float>& vExtScore,
+                               const cv::Mat& extDepthScaled)
+{
+	if (mSensor != IMU_STEREO) {
+		cerr << "ERROR: TrackStereoImu requires IMU_STEREO sensor mode." << endl;
+		assert(0);
+	}
+	{
+		unique_lock<mutex> lock(mMutexReset);
+		if (mbReset) {
+			mpTracker->Reset();
+			mbReset = false;
+			mbResetActiveMap = false;
+		}
+		else if (mbResetActiveMap) {
+			mpTracker->ResetActiveMap();
+			mbResetActiveMap = false;
+		}
+	}
+	for (const auto &imu : vImuMeas)
+		mpTracker->GrabImuData(imu);
+	const cv::Mat Tcw = mpTracker->GrabImageStereoDvl(imLeft, imRight, timestamp, false,
+	                                                   filename, vExtLeft, vExtRight,
+	                                                   vExtScore, extDepthScaled);
+	unique_lock<mutex> lock2(mMutexState);
+	mTrackingState = mpTracker->mState;
+	mTrackedMapPoints = mpTracker->mCurrentFrame.mvpMapPoints;
+	mTrackedKeyPointsUn = mpTracker->mCurrentFrame.mvKeysUn;
+	return Tcw;
+}
 
 void System::ActivateLocalizationMode()
 {

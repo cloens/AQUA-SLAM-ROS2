@@ -51,6 +51,7 @@ public:
                  int iniThFAST, int minThFAST);
 
     ~ORBextractor(){}
+    void BuildPyramid(const cv::Mat& image){ ComputePyramid(image); }
 
     // Compute the ORB features and descriptors on an image.
     // ORB are dispersed on the image using an octree.
@@ -112,4 +113,3 @@ protected:
 } //namespace ORB_SLAM
 
 #endif
-

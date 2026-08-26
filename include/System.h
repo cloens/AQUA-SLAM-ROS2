@@ -137,6 +137,12 @@ public:
 	                         const std::vector<cv::Point2f>& vExtRight = std::vector<cv::Point2f>(),
 	                         const std::vector<float>& vExtScore = std::vector<float>(),
 	                         const cv::Mat& extDepthScaled = cv::Mat());
+	cv::Mat TrackStereoImu(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp,
+	                      const vector<IMU::ImuPoint>& vImuMeas = vector<IMU::ImuPoint>(), string filename="",
+	                      const std::vector<cv::Point2f>& vExtLeft = std::vector<cv::Point2f>(),
+	                      const std::vector<cv::Point2f>& vExtRight = std::vector<cv::Point2f>(),
+	                      const std::vector<float>& vExtScore = std::vector<float>(),
+	                      const cv::Mat& extDepthScaled = cv::Mat());
 	cv::Mat TrackStereoGroDVLKLT(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::ImuPoint>& vImuMeas = vector<IMU::ImuPoint>(), bool bDVL= false, string filename="");
 
     void dvlCallBack(const nav_msgs::msg::Odometry::SharedPtr &dvl);

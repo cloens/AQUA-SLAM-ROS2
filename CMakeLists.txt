@@ -2,6 +2,19 @@
 cmake_minimum_required(VERSION 3.10...3.22)
 project(aqua_slam)
 
+# Bound memory-heavy C++ compilation even when a caller invokes colcon with a
+# large global -j value. CMake job pools are enforced by supporting generators
+# (notably Ninja); build_low_memory.sh also constrains Make at the process level.
+set(AQUA_COMPILE_JOBS "2" CACHE STRING "Maximum concurrent AQUA C++ compilations")
+if(NOT AQUA_COMPILE_JOBS MATCHES "^[1-9][0-9]*$")
+  message(FATAL_ERROR "AQUA_COMPILE_JOBS must be a positive integer")
+endif()
+set_property(GLOBAL PROPERTY JOB_POOLS
+  aqua_compile_pool=${AQUA_COMPILE_JOBS}
+  aqua_link_pool=1)
+set(CMAKE_JOB_POOL_COMPILE aqua_compile_pool)
+set(CMAKE_JOB_POOL_LINK aqua_link_pool)
+
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -w")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
@@ -266,6 +279,7 @@ add_library(${PROJECT_NAME} SHARED  # original
         ${PROJECT_SOURCE_DIR}/include/LocalMapping.h
         ${PROJECT_SOURCE_DIR}/include/LoopClosing.h
         ${PROJECT_SOURCE_DIR}/include/ORBextractor.h
+        ${PROJECT_SOURCE_DIR}/include/SuperPointExtractor.h
         ${PROJECT_SOURCE_DIR}/include/ORBmatcher.h
         ${PROJECT_SOURCE_DIR}/include/FrameDrawer.h
         ${PROJECT_SOURCE_DIR}/include/Converter.h
@@ -294,6 +308,7 @@ add_library(${PROJECT_NAME} SHARED  # original
         ${PROJECT_SOURCE_DIR}/src/LocalMapping.cc
         ${PROJECT_SOURCE_DIR}/src/LoopClosing.cc
         ${PROJECT_SOURCE_DIR}/src/ORBextractor.cc
+        ${PROJECT_SOURCE_DIR}/src/SuperPointExtractor.cc
         ${PROJECT_SOURCE_DIR}/src/ORBmatcher.cc
         ${PROJECT_SOURCE_DIR}/src/FrameDrawer.cc
         ${PROJECT_SOURCE_DIR}/src/Converter.cc
@@ -552,6 +567,20 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
 ## Testing ##
 #############
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_imu_preintegration_types
+    test/test_imu_preintegration_types.cpp
+  )
+  target_link_options(test_imu_preintegration_types PRIVATE -Wl,--no-as-needed)
+  target_link_libraries(test_imu_preintegration_types
+    -Wl,--start-group
+    ${PROJECT_NAME}_optimization
+    ${PROJECT_NAME}
+    -Wl,--end-group
+  )
+endif()
+
 ## Add gtest based cpp test target and link libraries
 # catkin_add_gtest(${PROJECT_NAME}-test test/test_dvl1.cpp)
 # if(TARGET ${PROJECT_NAME}-test)
@@ -580,9 +609,17 @@ install(FILES
   DESTINATION lib
 )
 
-install(DIRECTORY launch data urdf Vocabulary
+install(DIRECTORY launch data urdf
   DESTINATION share/${PROJECT_NAME}
 )
+
+# ORBvoc.txt is a large external runtime asset and Vocabulary/ is intentionally
+# gitignored. A clean source checkout must still build and install successfully.
+if(EXISTS "${PROJECT_SOURCE_DIR}/Vocabulary")
+  install(DIRECTORY Vocabulary
+    DESTINATION share/${PROJECT_NAME}
+  )
+endif()
 
 install(PROGRAMS
   scripts/dvl_converter.py

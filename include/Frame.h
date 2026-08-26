@@ -29,6 +29,7 @@
 
 #include "ImuTypes.h"
 #include "ORBVocabulary.h"
+#include "SuperPointExtractor.h"
 #include <DVLGroPreIntegration.h>
 
 #include <mutex>
@@ -61,6 +62,8 @@ public:
 
     // Extract ORB on the image. 0 for left image and 1 for right image.
     void ExtractORB(int flag, const cv::Mat &im, const int x0, const int x1);
+    bool ExtractSuperPointStereo(const cv::Mat &imLeftGray, const cv::Mat &imRightGray);
+    static void SetSharedSuperPoint(SuperPointExtractor* extractor);
 
     // Compute Bag of Words representation.
     void ComputeBoW();
@@ -354,6 +357,8 @@ public:
 
     cv::Mat imgLeft, imgRight;
     cv::Mat imgDepthScaled; // UW_SLAM: metric CV_32FC1 depth, empty if unused
+
+    static SuperPointExtractor* mpSharedSuperPoint;
 
     void PrintPointDistribution(){
         int left = 0, right = 0;

@@ -74,8 +74,16 @@ namespace ORB_SLAM3
 
     }
 
-    void DenseMapper::InsertNewKF(KeyFrame* pKF)
+    void DenseMapper::InsertNewKF(KeyFrame* pKF, bool retain_images_when_disabled)
     {
+        if (!mEnable) {
+            if (!retain_images_when_disabled) {
+                pKF->imgLeft.release();
+                pKF->imgRight.release();
+                pKF->imgDepthScaled.release();
+            }
+            return;
+        }
         if (pKF->GetMap()->GetAllKeyFrames().size() < 5) {
             // ROS_DEBUG_STREAM("DenserMapper: less than 5 KF in current map, skip");  // original
             RCLCPP_DEBUG(mNode->get_logger(), "DenserMapper: less than 5 KF in current map, skip");

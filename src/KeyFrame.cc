@@ -111,7 +111,10 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap, KeyFrameDatabase *pKFDB):
 
     mnOriginMapId = pMap->GetId();
 
+    mVd.setZero();
+    if (mpDvlPreintegrationKeyFrame && !mpDvlPreintegrationKeyFrame->mVelocity.empty()) {
         cv::cv2eigen(mpDvlPreintegrationKeyFrame->mVelocity, mVd);
+    }
 }
 
 void KeyFrame::ComputeBoW()
