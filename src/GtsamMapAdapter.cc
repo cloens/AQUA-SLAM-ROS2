@@ -101,6 +101,8 @@ bool GtsamMapAdapter::projectCommitted(
     };
     if (!projected || !std::isfinite(watermark.timestampSec))
         return reject("invalid committed-keyframe watermark");
+    if (source.version != watermark.mapVersion)
+        return reject("snapshot and committed-keyframe watermark versions differ");
 
     BackendMapSnapshot result = source;
     std::sort(result.keyframes.begin(), result.keyframes.end(),
@@ -225,8 +227,17 @@ BackendMapSnapshot GtsamMapAdapter::snapshot(Map& map,
         result.landmarks.push_back(state);
         validLandmarks.emplace(state.id, landmark);
     }
-    for (const auto& entry : validKeyframes) {
-        KeyFrame* keyframe = entry.second;
+    std::vector<KeyFrame*> orderedKeyframes;
+    orderedKeyframes.reserve(validKeyframes.size());
+    for (const auto& entry : validKeyframes)
+        orderedKeyframes.push_back(entry.second);
+    std::sort(orderedKeyframes.begin(), orderedKeyframes.end(),
+              [](const KeyFrame* left, const KeyFrame* right) {
+                  if (left->mTimeStamp != right->mTimeStamp)
+                      return left->mTimeStamp < right->mTimeStamp;
+                  return left->mnId < right->mnId;
+              });
+    for (KeyFrame* keyframe : orderedKeyframes) {
         const std::vector<MapPoint*> matches = keyframe->GetMapPointMatches();
         const std::size_t count = std::min(
             {matches.size(), keyframe->mvKeysUn.size(), keyframe->mvuRight.size()});

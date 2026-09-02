@@ -303,6 +303,7 @@ add_library(${PROJECT_NAME} SHARED  # original
         ${PROJECT_SOURCE_DIR}/include/RosHandling.h
         ${PROJECT_SOURCE_DIR}/include/DenseMapper.h
         ${PROJECT_SOURCE_DIR}/include/LKTracker.h
+        ${PROJECT_SOURCE_DIR}/include/GtsamMapAdapter.h
         ${PROJECT_SOURCE_DIR}/src/System.cc
         ${PROJECT_SOURCE_DIR}/src/Tracking.cc
         ${PROJECT_SOURCE_DIR}/src/LocalMapping.cc
@@ -333,7 +334,7 @@ add_library(${PROJECT_NAME} SHARED  # original
         ${PROJECT_SOURCE_DIR}/src/DenseMapper.cpp
         # ${PROJECT_SOURCE_DIR}/src/cv_bridge.cpp  # original
         ${PROJECT_SOURCE_DIR}/src/rgb_colors.cpp
-        ${PROJECT_SOURCE_DIR}/src/LKTracker.cpp src/FrameKLT.cpp src/FrameKLT.h src/Integrator.cpp src/Integrator.h)
+        ${PROJECT_SOURCE_DIR}/src/LKTracker.cpp src/FrameKLT.cpp src/FrameKLT.h src/Integrator.cpp src/Integrator.h ${PROJECT_SOURCE_DIR}/src/GtsamMapAdapter.cc)
 
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp
@@ -579,6 +580,17 @@ if(BUILD_TESTING)
     ${PROJECT_NAME}
     -Wl,--end-group
   )
+  ament_add_gtest(testGtsamMapLifecycle
+    test/TestGtsamMapLifecycle.cc
+  )
+  target_include_directories(testGtsamMapLifecycle PRIVATE
+    ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(testGtsamMapLifecycle
+    -Wl,--start-group
+    ${PROJECT_NAME}
+    -Wl,--end-group
+  )
+  target_link_options(testGtsamMapLifecycle PRIVATE -Wl,--no-as-needed)
 endif()
 
 ## Add gtest based cpp test target and link libraries
