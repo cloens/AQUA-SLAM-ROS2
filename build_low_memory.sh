@@ -6,7 +6,7 @@ cd "${workspace_dir}"
 
 # colcon's package worker count does not limit Make/Ninja inside one package.
 # Do not append inherited MAKEFLAGS: a trailing -j32 overrides the local cap.
-build_jobs="${AQUA_BUILD_JOBS:-2}"
+build_jobs="${AQUA_BUILD_JOBS:-1}"
 if ! [[ "${build_jobs}" =~ ^[1-9][0-9]*$ ]]; then
   echo "AQUA_BUILD_JOBS must be a positive integer, got: ${build_jobs}" >&2
   exit 2

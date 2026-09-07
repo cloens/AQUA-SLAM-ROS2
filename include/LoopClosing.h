@@ -21,15 +21,13 @@
 #define LOOPCLOSING_H
 
 #include "KeyFrame.h"
+#include "GtsamMapAdapter.h"
 
 #include "Atlas.h"
-#include "ORBVocabulary.h"
-
-
 #include <boost/algorithm/string.hpp>
+#include <array>
 #include <thread>
 #include <mutex>
-#include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
 // #include <ros/ros.h>  // original
 #include <rclcpp/rclcpp.hpp>
 // #include <image_transport/image_transport.h>  // original
@@ -48,21 +46,22 @@ class LocalMapping;
 class KeyFrameDatabase;
 class Map;
 class RosHandling;
+class NeuralFeatureFrontend;
 
 
 class LoopClosing
 {
+    friend class LoopClosingTestAccess;
 public:
 
-    typedef pair<set<KeyFrame*>,int> ConsistentGroup;
-	typedef map<KeyFrame*,g2o::Sim3> KeyFrameAndPose;
-//    typedef map<KeyFrame*,g2o::Sim3,std::less<KeyFrame*>,
-//        Eigen::aligned_allocator<std::pair<KeyFrame*, g2o::Sim3> > > KeyFrameAndPose;
+    typedef std::pair<std::set<KeyFrame*>,int> ConsistentGroup;
 
 public:
 
-    // LoopClosing(Atlas* pAtlas, KeyFrameDatabase* pDB, ORBVocabulary* pVoc, RosHandling* pRosHandler, const bool bFixScale, int mergingThreshold);  // original
-    LoopClosing(Atlas* pAtlas, KeyFrameDatabase* pDB, ORBVocabulary* pVoc, RosHandling* pRosHandler, const bool bFixScale, int mergingThreshold, rclcpp::Node::SharedPtr node);
+    LoopClosing(Atlas* pAtlas, KeyFrameDatabase* pDB,
+                RosHandling* pRosHandler, const bool bFixScale,
+                int mergingThreshold, rclcpp::Node::SharedPtr node,
+                NeuralFeatureFrontend* featureFrontend);
 
     void SetTracker(Tracking* pTracker);
 
@@ -82,11 +81,11 @@ public:
     void RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoopKF);
 
     bool isRunningGBA(){
-        unique_lock<std::mutex> lock(mMutexGBA);
+        std::unique_lock<std::mutex> lock(mMutexGBA);
         return mbRunningGBA;
     }
     bool isFinishedGBA(){
-        unique_lock<std::mutex> lock(mMutexGBA);
+        std::unique_lock<std::mutex> lock(mMutexGBA);
         return mbFinishedGBA;
     }   
 
@@ -110,53 +109,16 @@ public:
 
 protected:
 
+    LoopClosing() = default;
+
     bool CheckNewKeyFrames();
 
 
     //Methods to implement the new place recognition algorithm
     bool NewDetectCommonRegions();
-    /*!
-     *
-     * @param pCurrentKF current keyframe
-     * @param pMatchedKF best matches keyframe from candidate keyframes
-     * @param gScw
-     * @param nNumProjMatches
-     * @param vpMPs
-     * @param vpMatchedMPs
-     * @return
-     */
-    bool DetectAndReffineSim3FromLastKF(KeyFrame* pCurrentKF, KeyFrame* pMatchedKF, g2o::Sim3 &gScw, int &nNumProjMatches,
-                                        std::vector<MapPoint*> &vpMPs, std::vector<MapPoint*> &vpMatchedMPs);
-    /*!
-     *
-     * @param vpBowCand(in) all candidate ketframes find by DBoW
-     * @param pMatchedKF(out) best matched keyframe from candidate keyframes
-     * @param pLastCurrentKF(out) the last keyframe when the last loop detected
-     * @param g2oScw(out) world to current keyframe(the loop result, not the odometry result!)
-     * @param nNumCoincidences(out) how many keyframes which has good covisibility with current keyframe also match the transformation
-     * @param vpMPs(out)
-     * @param vpMatchedMPs(out)
-     * @return
-     */
-    bool DetectCommonRegionsFromBoW(std::vector<KeyFrame*> &vpBowCand, KeyFrame* &pMatchedKF, KeyFrame* &pLastCurrentKF, g2o::Sim3 &g2oScw,
-                                     int &nNumCoincidences, std::vector<MapPoint*> &vpMPs, std::vector<MapPoint*> &vpMatchedMPs);
-    bool DetectCommonRegionsFromLastKF(KeyFrame* pCurrentKF, KeyFrame* pMatchedKF, g2o::Sim3 &gScw, int &nNumProjMatches,
-                                            std::vector<MapPoint*> &vpMPs, std::vector<MapPoint*> &vpMatchedMPs);
-    int FindMatchesByProjection(KeyFrame* pCurrentKF, KeyFrame* pMatchedKFw, g2o::Sim3 &g2oScw,
-                                set<MapPoint*> &spMatchedMPinOrigin, vector<MapPoint*> &vpMapPoints,
-                                vector<MapPoint*> &vpMatchedMapPoints);
-
-
-    void SearchAndFuse(const KeyFrameAndPose &CorrectedPosesMap, vector<MapPoint*> &vpMapPoints);
-    void SearchAndFuse(const vector<KeyFrame*> &vConectedKFs, vector<MapPoint*> &vpMapPoints);
-
     void CorrectLoop();
+    void CorrectMerge();
 
-    void MergeLocal();
-    void MergeLocal2();
-
-    void CheckObservations(set<KeyFrame*> &spKFsMap1, set<KeyFrame*> &spKFsMap2);
-    void printReprojectionError(set<KeyFrame*> &spLocalWindowKFs, KeyFrame* mpCurrentKF, string &name);
 
     void ResetIfRequested();
     bool mbResetRequested;
@@ -175,7 +137,7 @@ protected:
 	RosHandling* mpRosHandler;
 
     KeyFrameDatabase* mpKeyFrameDB;
-    ORBVocabulary* mpORBVocabulary;
+    NeuralFeatureFrontend* mpFeatureFrontend;
 
     LocalMapping *mpLocalMapper;
 
@@ -197,7 +159,6 @@ protected:
     std::vector<MapPoint*> mvpCurrentMatchedPoints;
     std::vector<MapPoint*> mvpLoopMapPoints;
     cv::Mat mScw;
-    g2o::Sim3 mg2oScw;
 
     //-------
     Map* mpLastMap;
@@ -207,30 +168,30 @@ protected:
     int mnLoopNumNotFound;
 	// the last keyframe when the last loop detected
     KeyFrame* mpLoopLastCurrentKF;
-    g2o::Sim3 mg2oLoopSlw;
-    g2o::Sim3 mg2oLoopScw;
 	/**
 	 * the best matched keyframe
 	 * it will be set when the loop detected successfully
 	 * it will be erase when the loop detection failed
 	 */
     KeyFrame* mpLoopMatchedKF;
+    std::vector<BackendLandmarkReplacement> mLoopLandmarkReplacements;
     std::vector<MapPoint*> mvpLoopMPs;
     std::vector<MapPoint*> mvpLoopMatchedMPs;
     bool mbMergeDetected;
     int mnMergeNumCoincidences;
     int mnMergeNumNotFound;
     KeyFrame* mpMergeLastCurrentKF;
-    g2o::Sim3 mg2oMergeSlw;
-    g2o::Sim3 mg2oMergeSmw;
-    g2o::Sim3 mg2oMergeScw;
     // the best keyframe selected from the candidate ketframes
     KeyFrame* mpMergeMatchedKF;
+    std::array<float, 16> mMergeCurrentFromCandidate{};
+    std::size_t mMergeInliers = 0;
+    std::size_t mMergeCorrespondenceCount = 0;
+    double mMergeRmsErrorMeters = 0.0;
+    BackendMergeHypothesis mMergeHypothesis{256U, 2U};
     std::vector<MapPoint*> mvpMergeMPs;
     std::vector<MapPoint*> mvpMergeMatchedMPs;
     std::vector<KeyFrame*> mvpMergeConnectedKFs;
 
-    g2o::Sim3 mSold_new;
     //-------
 
     long unsigned int mLastLoopKFid;

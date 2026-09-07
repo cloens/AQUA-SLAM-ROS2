@@ -392,7 +392,7 @@ void FrameDrawer::DrawTextInfo(cv::Mat &im, int nState, cv::Mat &imText)
     }
     else if(nState==Tracking::SYSTEM_NOT_READY)
     {
-        s << " LOADING ORB VOCABULARY. PLEASE WAIT...";
+        s << " LOADING FEATURE FRONTEND. PLEASE WAIT...";
     }
 
     int baseline=0;

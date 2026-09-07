@@ -17,8 +17,8 @@
 */
 
 
-#ifndef ORBMATCHER_H
-#define ORBMATCHER_H
+#ifndef FEATUREMATCHER_H
+#define FEATUREMATCHER_H
 
 #include<vector>
 #include<opencv2/core/core.hpp>
@@ -32,14 +32,15 @@
 namespace ORB_SLAM3
 {
 
-class ORBmatcher
+class NeuralFeatureFrontend;
+
+class FeatureMatcher
 {    
 public:
 
-    ORBmatcher(float nnratio=0.6, bool checkOri=true);
+    FeatureMatcher(NeuralFeatureFrontend& frontend, float nnratio=0.6);
 
-    // Computes the Hamming distance between two ORB descriptors
-    static int DescriptorDistance(const cv::Mat &a, const cv::Mat &b);
+    static float DescriptorDistance(const cv::Mat &a, const cv::Mat &b);
 
 	int searchByLKTracking(Frame &CurrentFrame, const Frame &LastFrame);
 
@@ -53,11 +54,11 @@ public:
 
     // Project MapPoints seen in KeyFrame into the Frame and search matches.
     // Used in relocalisation (Tracking)
-    int SearchByProjection(Frame &CurrentFrame, KeyFrame* pKF, const std::set<MapPoint*> &sAlreadyFound, const float th, const int ORBdist);
+    int SearchByProjection(Frame &CurrentFrame, KeyFrame* pKF, const std::set<MapPoint*> &sAlreadyFound, const float th);
 
     // Project MapPoints using a Similarity Transformation and search matches.
     // Used in loop detection (Loop Closing)
-    int SearchByProjection(KeyFrame* pKF, cv::Mat Scw, const std::vector<MapPoint*> &vpPoints, std::vector<MapPoint*> &vpMatched, int th, float ratioHamming=1.0);
+    int SearchByProjection(KeyFrame* pKF, cv::Mat Scw, const std::vector<MapPoint*> &vpPoints, std::vector<MapPoint*> &vpMatched, int th);
 
 
     /***
@@ -73,23 +74,20 @@ public:
      * @param vpMatchedKF(out)
      * @return the number of matches
      */
-    int SearchByProjection(KeyFrame* pKF, cv::Mat Scw, const std::vector<MapPoint*> &vpPoints, const std::vector<KeyFrame*> &vpPointsKFs, std::vector<MapPoint*> &vpMatched, std::vector<KeyFrame*> &vpMatchedKF, int th, float ratioHamming=1.0);
+    int SearchByProjection(KeyFrame* pKF, cv::Mat Scw, const std::vector<MapPoint*> &vpPoints, const std::vector<KeyFrame*> &vpPointsKFs, std::vector<MapPoint*> &vpMatched, std::vector<KeyFrame*> &vpMatchedKF, int th);
 
-    // Search matches between MapPoints in a KeyFrame and ORB in a Frame.
-    // Brute force constrained to ORB that belong to the same vocabulary node (at a certain level)
-    // Used in Relocalisation and Loop Detection
-    int SearchByBoW(KeyFrame *pKF, Frame &F, std::vector<MapPoint*> &vpMapPointMatches);
-    int SearchByBoW(KeyFrame *pKF1, KeyFrame* pKF2, std::vector<MapPoint*> &vpMatches12);
+    int SearchByNeuralPair(KeyFrame* keyframe, Frame& frame,
+                           std::vector<MapPoint*>& mapPointMatches);
+    int SearchByNeuralPair(KeyFrame* first, KeyFrame* second,
+                           std::vector<MapPoint*>& matches);
 
     // Matching for the Map Initialization (only used in the monocular case)
     int SearchForInitialization(Frame &F1, Frame &F2, std::vector<cv::Point2f> &vbPrevMatched, std::vector<int> &vnMatches12, int windowSize=10);
 
-    // Matching to triangulate new MapPoints. Check Epipolar Constraint.
-    int SearchForTriangulation(KeyFrame *pKF1, KeyFrame* pKF2, cv::Mat F12,
-                               std::vector<pair<size_t, size_t> > &vMatchedPairs, const bool bOnlyStereo, const bool bCoarse = false);
-
-    int SearchForTriangulation(KeyFrame *pKF1, KeyFrame *pKF2, cv::Mat F12,
-                                           vector<pair<size_t, size_t> > &vMatchedPairs, const bool bOnlyStereo, vector<cv::Mat> &vMatchedPoints);
+    int SearchForNeuralTriangulation(
+        KeyFrame* first, KeyFrame* second, const cv::Mat& fundamental,
+        std::vector<std::pair<size_t, size_t>>& matchedPairs,
+        bool onlyStereo);
 
     // Search matches between MapPoints seen in KF1 and KF2 transforming by a Sim3 [s12*R12|t12]
     // In the stereo and RGB-D case, s12=1
@@ -103,8 +101,6 @@ public:
 
 public:
 
-    static const int TH_LOW;
-    static const int TH_HIGH;
     static const int HISTO_LENGTH;
 
 
@@ -118,9 +114,11 @@ protected:
     void ComputeThreeMaxima(std::vector<int>* histo, const int L, int &ind1, int &ind2, int &ind3);
 
     float mfNNratio;
+    float mfDescriptorThreshold;
     bool mbCheckOrientation;
+    NeuralFeatureFrontend* mpNeuralFrontend = nullptr;
 };
 
 }// namespace ORB_SLAM
 
-#endif // ORBMATCHER_H
+#endif // FEATUREMATCHER_H

@@ -21,6 +21,9 @@
 #define IMUTYPES_H
 
 #include<vector>
+#include<array>
+#include<cstdint>
+#include<limits>
 #include<utility>
 #include<opencv2/core/core.hpp>
 #include <Eigen/Core>
@@ -33,6 +36,13 @@
 
 namespace ORB_SLAM3
 {
+
+enum class DvlTrackMode
+{
+	BottomTrack,
+	WaterTrack,
+	Unknown
+};
 
 namespace IMU
 {
@@ -230,6 +240,16 @@ public:
 	cv::Point3d v;
 	Eigen::Vector4d vb;
 	double t;
+	bool isDvlMeasurement = false;
+	bool dvlHealthAccepted = false;
+	std::array<double, 9> dvlCovariance{};
+	cv::Point3d dvlAngularVelocityBody;
+	DvlTrackMode dvlTrackMode = DvlTrackMode::Unknown;
+	double dvlValidBeamRatio = std::numeric_limits<double>::quiet_NaN();
+	bool dvlAltitudeValid = false;
+	double dvlAltitudeMeters = std::numeric_limits<double>::quiet_NaN();
+	double dvlErrorVelocityMetersPerSec = std::numeric_limits<double>::quiet_NaN();
+	std::int64_t dvlStatus = 0;
 };
 
 //IMU biases (gyro and accelerometer)

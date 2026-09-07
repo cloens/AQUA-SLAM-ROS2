@@ -2,10 +2,18 @@
 cmake_minimum_required(VERSION 3.10...3.22)
 project(aqua_slam)
 
+list(PREPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+set(ONNXRUNTIME_ROOT "" CACHE PATH "Project-owned ONNX Runtime CUDA prefix")
+find_package(ONNXRuntime REQUIRED)
+
+# AQUA uses the real dynamic GTSAM backend for every production build.
+set(UW_DYNAMIC_BACKEND_ROOT "" CACHE PATH
+    "Path to a built uw_dynamic_backend checkout (required)")
+
 # Bound memory-heavy C++ compilation even when a caller invokes colcon with a
 # large global -j value. CMake job pools are enforced by supporting generators
 # (notably Ninja); build_low_memory.sh also constrains Make at the process level.
-set(AQUA_COMPILE_JOBS "2" CACHE STRING "Maximum concurrent AQUA C++ compilations")
+set(AQUA_COMPILE_JOBS "1" CACHE STRING "Maximum concurrent AQUA C++ compilations")
 if(NOT AQUA_COMPILE_JOBS MATCHES "^[1-9][0-9]*$")
   message(FATAL_ERROR "AQUA_COMPILE_JOBS must be a positive integer")
 endif()
@@ -90,15 +98,8 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 
 find_package(pcl_conversions REQUIRED)
-# Optional UW_SLAM bridge message for SuperPoint match injection
-find_package(uw_slam_bridge QUIET)
-if(uw_slam_bridge_FOUND)
-  message(STATUS "UW_SLAM: found uw_slam_bridge, enabling StereoMatches injection")
-  add_definitions(-DUW_SLAM_HAS_STEREO_MATCHES=1)
-  list(APPEND dependencies uw_slam_bridge)
-else()
-  message(STATUS "UW_SLAM: uw_slam_bridge not found; building without StereoMatches msg")
-endif()
+# Normalized DVL and SuperPoint message contracts are owned by uw_slam_bridge.
+find_package(uw_slam_bridge REQUIRED)
 # find_package(pcl_ros REQUIRED)
 # -----------------------------------------------------------------------------
 
@@ -252,9 +253,11 @@ link_directories(
 )
 add_definitions(${PCL_DEFINITIONS})
 
-add_subdirectory(${PROJECT_SOURCE_DIR}/Thirdparty/g2o)
-add_subdirectory(${PROJECT_SOURCE_DIR}/Thirdparty/DBoW2)
 add_subdirectory(${PROJECT_SOURCE_DIR}/Thirdparty/octomap)
+
+if(NOT UW_DYNAMIC_BACKEND_ROOT)
+  message(FATAL_ERROR "UW_DYNAMIC_BACKEND_ROOT is required: AQUA supports only GTSAM_DYNAMIC")
+endif()
 
 ## Add cmake target dependencies of the library
 ## as an example, code may need to be generated before libraries
@@ -278,9 +281,9 @@ add_library(${PROJECT_NAME} SHARED  # original
         ${PROJECT_SOURCE_DIR}/include/Tracking.h
         ${PROJECT_SOURCE_DIR}/include/LocalMapping.h
         ${PROJECT_SOURCE_DIR}/include/LoopClosing.h
-        ${PROJECT_SOURCE_DIR}/include/ORBextractor.h
-        ${PROJECT_SOURCE_DIR}/include/SuperPointExtractor.h
-        ${PROJECT_SOURCE_DIR}/include/ORBmatcher.h
+        ${PROJECT_SOURCE_DIR}/include/NeuralFeatureFrontend.h
+        ${PROJECT_SOURCE_DIR}/include/FeatureMatcher.h
+        ${PROJECT_SOURCE_DIR}/include/Random.h
         ${PROJECT_SOURCE_DIR}/include/FrameDrawer.h
         ${PROJECT_SOURCE_DIR}/include/Converter.h
         ${PROJECT_SOURCE_DIR}/include/MapPoint.h
@@ -290,7 +293,7 @@ add_library(${PROJECT_NAME} SHARED  # original
 #        ${PROJECT_SOURCE_DIR}/include/MapDrawer.h
         ${PROJECT_SOURCE_DIR}/include/PnPsolver.h
         ${PROJECT_SOURCE_DIR}/include/Frame.h
-        ${PROJECT_SOURCE_DIR}/include/KeyFrameDatabase.h
+        ${PROJECT_SOURCE_DIR}/include/KeyFrameRegistry.h
         ${PROJECT_SOURCE_DIR}/include/Sim3Solver.h
         ${PROJECT_SOURCE_DIR}/include/Initializer.h
 #        ${PROJECT_SOURCE_DIR}/include/Viewer.h
@@ -303,14 +306,18 @@ add_library(${PROJECT_NAME} SHARED  # original
         ${PROJECT_SOURCE_DIR}/include/RosHandling.h
         ${PROJECT_SOURCE_DIR}/include/DenseMapper.h
         ${PROJECT_SOURCE_DIR}/include/LKTracker.h
+        ${PROJECT_SOURCE_DIR}/include/BackendFacade.h
+        ${PROJECT_SOURCE_DIR}/include/AquaBackendAdapter.h
+        ${PROJECT_SOURCE_DIR}/include/GtsamBackendAdapter.h
         ${PROJECT_SOURCE_DIR}/include/GtsamMapAdapter.h
+        ${PROJECT_SOURCE_DIR}/include/GtsamMapOptimizationAdapter.h
         ${PROJECT_SOURCE_DIR}/src/System.cc
         ${PROJECT_SOURCE_DIR}/src/Tracking.cc
         ${PROJECT_SOURCE_DIR}/src/LocalMapping.cc
         ${PROJECT_SOURCE_DIR}/src/LoopClosing.cc
-        ${PROJECT_SOURCE_DIR}/src/ORBextractor.cc
-        ${PROJECT_SOURCE_DIR}/src/SuperPointExtractor.cc
-        ${PROJECT_SOURCE_DIR}/src/ORBmatcher.cc
+        ${PROJECT_SOURCE_DIR}/src/NeuralFeatureFrontend.cc
+        ${PROJECT_SOURCE_DIR}/src/FeatureMatcher.cc
+        ${PROJECT_SOURCE_DIR}/src/Random.cc
         ${PROJECT_SOURCE_DIR}/src/FrameDrawer.cc
         ${PROJECT_SOURCE_DIR}/src/Converter.cc
         ${PROJECT_SOURCE_DIR}/src/MapPoint.cc
@@ -318,10 +325,9 @@ add_library(${PROJECT_NAME} SHARED  # original
         ${PROJECT_SOURCE_DIR}/src/Atlas.cc
         ${PROJECT_SOURCE_DIR}/src/Map.cc
 #        ${PROJECT_SOURCE_DIR}/src/MapDrawer.cc
-        ${PROJECT_SOURCE_DIR}/src/DvlGyroOptimizer.cpp
         ${PROJECT_SOURCE_DIR}/src/PnPsolver.cc
         ${PROJECT_SOURCE_DIR}/src/Frame.cc
-        ${PROJECT_SOURCE_DIR}/src/KeyFrameDatabase.cc
+        ${PROJECT_SOURCE_DIR}/src/KeyFrameRegistry.cc
         ${PROJECT_SOURCE_DIR}/src/Sim3Solver.cc
         ${PROJECT_SOURCE_DIR}/src/Initializer.cc
 #        ${PROJECT_SOURCE_DIR}/src/Viewer.cc
@@ -334,7 +340,37 @@ add_library(${PROJECT_NAME} SHARED  # original
         ${PROJECT_SOURCE_DIR}/src/DenseMapper.cpp
         # ${PROJECT_SOURCE_DIR}/src/cv_bridge.cpp  # original
         ${PROJECT_SOURCE_DIR}/src/rgb_colors.cpp
-        ${PROJECT_SOURCE_DIR}/src/LKTracker.cpp src/FrameKLT.cpp src/FrameKLT.h src/Integrator.cpp src/Integrator.h ${PROJECT_SOURCE_DIR}/src/GtsamMapAdapter.cc)
+        ${PROJECT_SOURCE_DIR}/src/LKTracker.cpp
+        ${PROJECT_SOURCE_DIR}/src/FrameKLT.cpp
+        ${PROJECT_SOURCE_DIR}/src/FrameKLT.h
+        ${PROJECT_SOURCE_DIR}/src/Integrator.cpp
+        ${PROJECT_SOURCE_DIR}/src/Integrator.h
+  ${PROJECT_SOURCE_DIR}/src/BackendFacade.cc
+  ${PROJECT_SOURCE_DIR}/src/AquaBackendAdapter.cc
+  ${PROJECT_SOURCE_DIR}/src/DvlObservationAdapter.cc
+  ${PROJECT_SOURCE_DIR}/src/MotionModelPose.cc
+        ${PROJECT_SOURCE_DIR}/src/GtsamMapAdapter.cc)
+
+if(NOT EXISTS "${UW_DYNAMIC_BACKEND_ROOT}/include/uw_dynamic_backend/incremental_backend.h")
+  message(FATAL_ERROR "UW_DYNAMIC_BACKEND_ROOT does not contain uw_dynamic_backend headers")
+endif()
+find_package(GTSAM CONFIG REQUIRED
+  PATHS "${UW_DYNAMIC_BACKEND_ROOT}/build/install/lib/cmake/GTSAM"
+  NO_DEFAULT_PATH)
+add_library(uw_dynamic_uncertainty STATIC IMPORTED GLOBAL)
+set_target_properties(uw_dynamic_uncertainty PROPERTIES
+  IMPORTED_LOCATION "${UW_DYNAMIC_BACKEND_ROOT}/build/backend/libuw_dynamic_uncertainty.a"
+  INTERFACE_INCLUDE_DIRECTORIES
+    "${UW_DYNAMIC_BACKEND_ROOT}/include;${UW_DYNAMIC_BACKEND_ROOT}/build/backend/generated")
+target_sources(${PROJECT_NAME} PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/GtsamBackendAdapter.cc
+  ${PROJECT_SOURCE_DIR}/src/GtsamMapOptimizationAdapter.cc
+  ${PROJECT_SOURCE_DIR}/src/ImuTypes.cc
+  ${PROJECT_SOURCE_DIR}/src/DVLGroPreIntegration.cpp)
+target_link_libraries(${PROJECT_NAME}
+  uw_dynamic_uncertainty gtsam yaml-cpp)
+target_compile_definitions(${PROJECT_NAME} PUBLIC AQUA_HAS_GTSAM_DYNAMIC=1)
+set(AQUA_DYNAMIC_BACKEND_ENABLED ON)
 
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp
@@ -345,6 +381,7 @@ ament_target_dependencies(${PROJECT_NAME}
   sensor_msgs
   nav_msgs
   geometry_msgs
+  uw_slam_bridge
   octomap_msgs
   visualization_msgs
 
@@ -358,58 +395,13 @@ ament_target_dependencies(${PROJECT_NAME}
   pcl_conversions
 )
 
-# add_library(${PROJECT_NAME}_Optmization SHARED  # original
-add_library(${PROJECT_NAME}_optimization SHARED
-# add_library(aqua_slam_optimization SHARED 
-        ${PROJECT_SOURCE_DIR}/include/Optimizer.h
-        ${PROJECT_SOURCE_DIR}/include/ImuTypes.h
-        ${PROJECT_SOURCE_DIR}/include/DVLGroPreIntegration.h
-        ${PROJECT_SOURCE_DIR}/include/G2oTypes.h
-        ${PROJECT_SOURCE_DIR}/include/OptimizableTypes.h
-        ${PROJECT_SOURCE_DIR}/src/Optimizer.cc
-        ${PROJECT_SOURCE_DIR}/src/ImuTypes.cc
-        ${PROJECT_SOURCE_DIR}/src/DVLGroPreIntegration.cpp
-        ${PROJECT_SOURCE_DIR}/src/G2oTypes.cc
-        ${PROJECT_SOURCE_DIR}/src/OptimizableTypes.cpp)
-ament_target_dependencies(${PROJECT_NAME}_optimization
-  rclcpp
-  sensor_msgs
-  nav_msgs
-  geometry_msgs
-  std_srvs
-  image_transport
-  cv_bridge
-  visualization_msgs
-  octomap_msgs
-  tf2_ros
-  tf2_geometry_msgs
-  tf2_sensor_msgs
-  pcl_conversions
-)
-# target_link_libraries(${PROJECT_NAME}_Optmization  # original
-target_link_libraries(${PROJECT_NAME}_optimization
-# target_link_libraries(aqua_slam_node_optimization
-        ${OpenCV_LIBS}
-        ${EIGEN3_LIBS}
-        ${Boost_LIBRARIES}
-        ${PCL_LIBRARIES}
-        # ${VTK_LIBRARIES}  # temporary: disabled
-        fmt::fmt-header-only
-        ${Sophus_LIBRARIES}
-        DBoW2
-        g2o
-
-        # ${catkin_LIBRARIES}  # original
-        )
 target_link_libraries(${PROJECT_NAME}
-        ${PROJECT_NAME}_optimization
         ${OpenCV_LIBS}
         ${EIGEN3_LIBS}
         ${Boost_LIBRARIES}
         ${PCL_LIBRARIES}
         # ${VTK_LIBRARIES}  # temporary: disabled
         fmt::fmt-header-only
-        DBoW2
         octomap
         # ${catkin_LIBRARIES}  # original
         -lboost_serialization
@@ -417,7 +409,16 @@ target_link_libraries(${PROJECT_NAME}
         -lboost_filesystem
         -lboost_iostreams
         -lcrypto
+        Boost::log_setup
+        Boost::log
+        ONNXRuntime::ONNXRuntime
         )
+
+# Main AQUA libraries must also be build-tree local; otherwise a legacy and a
+# dynamic configure overwrite the same source-tree .so and tests load ABI-mixed
+# binaries.
+set_target_properties(${PROJECT_NAME} PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 # ROS 2 -----------------------------------------------------------------------
 add_executable(${PROJECT_NAME}_node src/node.cpp)
@@ -444,24 +445,31 @@ ament_target_dependencies(${PROJECT_NAME}_node
   pcl_conversions
 #   pcl_ros
 )
-if(uw_slam_bridge_FOUND)
-  ament_target_dependencies(${PROJECT_NAME}_node uw_slam_bridge)
-endif()
+ament_target_dependencies(${PROJECT_NAME}_node uw_slam_bridge)
 
 # target_link_libraries(stereo_dvl2 ${Boost_LIBRARIES} ${PROJECT_NAME} ${PROJECT_NAME}_Optmization)  // original
 target_link_libraries(${PROJECT_NAME}_node
   ${PROJECT_NAME}
-  ${PROJECT_NAME}_optimization
   ${Boost_LIBRARIES}
+  Boost::log_setup
+  Boost::log
 )
 # -----------------------------------------------------------------------------
 
-#add_executable(g2o_BA src/g2o_BA.cpp)
-#target_link_libraries(g2o_BA ${PROJECT_NAME} ${PROJECT_NAME}_Optmization)
 #target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 #add_dependencies(${PROJECT_NAME} ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
+# Keep executables inside their build tree.  Writing to the source checkout
+# made parallel legacy/dynamic builds overwrite each other's test binaries.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_executable(neural_frontend_benchmark src/NeuralFrontendBenchmark.cc
+  src/NeuralFeatureFrontend.cc)
+target_include_directories(neural_frontend_benchmark PRIVATE
+  ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(neural_frontend_benchmark
+  ONNXRuntime::ONNXRuntime
+  ${OpenCV_LIBS}
+  crypto)
 ## Declare a C++ executable
 ## With catkin_make all packages are built within a single CMake context
 ## The recommended prefix ensures that target names across packages don't collide
@@ -570,16 +578,101 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  add_executable(testOnnxRuntimeCudaContract
+    test/TestOnnxRuntimeCudaContract.cc)
+  target_link_libraries(testOnnxRuntimeCudaContract
+    ONNXRuntime::ONNXRuntime)
+  add_test(NAME testOnnxRuntimeCudaContract
+    COMMAND testOnnxRuntimeCudaContract
+      "${ONNXRUNTIME_ROOT}/models/superpoint.onnx"
+      "${ONNXRUNTIME_ROOT}/models/superpoint_lightglue_fused.onnx")
+  set_tests_properties(testOnnxRuntimeCudaContract PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${ONNXRUNTIME_ROOT}/lib:$ENV{LD_LIBRARY_PATH}")
+  ament_add_gtest(testNeuralFeatureFrontend
+    test/TestNeuralFeatureFrontend.cc
+    src/NeuralFeatureFrontend.cc)
+  target_include_directories(testNeuralFeatureFrontend PRIVATE
+    ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(testNeuralFeatureFrontend
+    ONNXRuntime::ONNXRuntime
+    ${OpenCV_LIBS}
+    crypto)
+  set_tests_properties(testNeuralFeatureFrontend PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${ONNXRUNTIME_ROOT}/lib:$ENV{LD_LIBRARY_PATH}")
+  ament_add_gtest(testNeuralStereoTemporalContract
+    test/TestNeuralStereoTemporalContract.cc)
+  target_link_libraries(testNeuralStereoTemporalContract
+    ${PROJECT_NAME})
+  set_tests_properties(testNeuralStereoTemporalContract PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${ONNXRUNTIME_ROOT}/lib:$ENV{LD_LIBRARY_PATH}")
+  ament_add_gtest(testFeatureMatcher
+    test/TestFeatureMatcher.cc)
+  target_include_directories(testFeatureMatcher PRIVATE
+    ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(testFeatureMatcher
+    ${PROJECT_NAME})
   ament_add_gtest(test_imu_preintegration_types
     test/test_imu_preintegration_types.cpp
   )
   target_link_options(test_imu_preintegration_types PRIVATE -Wl,--no-as-needed)
   target_link_libraries(test_imu_preintegration_types
     -Wl,--start-group
-    ${PROJECT_NAME}_optimization
     ${PROJECT_NAME}
     -Wl,--end-group
   )
+  ament_add_gtest(testBackendFacade
+    test/TestBackendFacade.cc
+    src/BackendFacade.cc
+  )
+  target_include_directories(testBackendFacade PRIVATE
+    ${PROJECT_SOURCE_DIR}/include)
+  ament_add_gtest(testAquaBackendAdapter
+    test/TestAquaBackendAdapter.cc
+    src/AquaBackendAdapter.cc
+    src/DvlObservationAdapter.cc
+  )
+  target_include_directories(testAquaBackendAdapter PRIVATE
+    ${PROJECT_SOURCE_DIR}/include)
+  ament_target_dependencies(testAquaBackendAdapter uw_slam_bridge)
+  target_link_libraries(testAquaBackendAdapter
+    -Wl,--start-group
+    ${PROJECT_NAME}
+    -Wl,--end-group
+  )
+  ament_add_gtest(testDynamicKeyframeImuBuffer
+    test/TestDynamicKeyframeImuBuffer.cc
+  )
+  target_include_directories(testDynamicKeyframeImuBuffer PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS})
+  ament_add_gtest(testMotionModelPose
+    test/TestMotionModelPose.cc
+    src/MotionModelPose.cc
+  )
+  target_include_directories(testMotionModelPose PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(testMotionModelPose ${OpenCV_LIBS})
+  ament_add_gtest(testGtsamBackendAdapter
+      test/TestGtsamBackendAdapter.cc
+      test/TestGtsamBackendConcurrency.cc
+    )
+    target_include_directories(testGtsamBackendAdapter PRIVATE
+      ${PROJECT_SOURCE_DIR}/include
+      ${UW_DYNAMIC_BACKEND_ROOT}/test)
+    target_compile_definitions(testGtsamBackendAdapter PRIVATE
+      UW_DYNAMIC_BACKEND_ROOT_PATH="${UW_DYNAMIC_BACKEND_ROOT}")
+    target_link_libraries(testGtsamBackendAdapter
+      -Wl,--start-group
+      ${PROJECT_NAME}
+      uw_dynamic_uncertainty
+      gtsam
+      yaml-cpp
+      ${OpenCV_LIBS}
+      Boost::log_setup
+      Boost::log
+      -Wl,--end-group
+    )
   ament_add_gtest(testGtsamMapLifecycle
     test/TestGtsamMapLifecycle.cc
   )
@@ -607,17 +700,23 @@ install(TARGETS ${PROJECT_NAME}_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(TARGETS ${PROJECT_NAME} ${PROJECT_NAME}_optimization
+install(TARGETS neural_frontend_benchmark
+  RUNTIME DESTINATION bin
+)
+
+install(TARGETS ${PROJECT_NAME}
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
   RUNTIME DESTINATION bin
 )
 
+install(DIRECTORY include/
+  DESTINATION include/${PROJECT_NAME}
+  FILES_MATCHING PATTERN "*.h")
+
 install(FILES
   ${PROJECT_SOURCE_DIR}/lib/liboctomap.so
   ${PROJECT_SOURCE_DIR}/lib/liboctomath.so
-  ${PROJECT_SOURCE_DIR}/Thirdparty/DBoW2/lib/libDBoW2.so
-  ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
   DESTINATION lib
 )
 
@@ -625,13 +724,6 @@ install(DIRECTORY launch data urdf
   DESTINATION share/${PROJECT_NAME}
 )
 
-# ORBvoc.txt is a large external runtime asset and Vocabulary/ is intentionally
-# gitignored. A clean source checkout must still build and install successfully.
-if(EXISTS "${PROJECT_SOURCE_DIR}/Vocabulary")
-  install(DIRECTORY Vocabulary
-    DESTINATION share/${PROJECT_NAME}
-  )
-endif()
 
 install(PROGRAMS
   scripts/dvl_converter.py

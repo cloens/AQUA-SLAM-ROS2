@@ -20,32 +20,107 @@
 #include "Atlas.h"
 #include "LoopClosing.h"
 #include "Tracking.h"
-#include "KeyFrameDatabase.h"
+#include "KeyFrameRegistry.h"
 
 #include "LocalMapping.h"
 #include "InertialMaturity.h"
-#include "ORBmatcher.h"
-#include "Optimizer.h"
-#include "DvlGyroOptimizer.h"
+#include "FeatureMatcher.h"
+#include "GtsamMapAdapter.h"
+#include "GtsamMapOptimizationAdapter.h"
+#include "GtsamBackendAdapter.h"
 #include "Converter.h"
 #include "System.h"
 #include <sophus/geometry.hpp>
 
 #include<mutex>
 #include<chrono>
+#include<sstream>
 
 namespace ORB_SLAM3
 {
+namespace
+{
+std::string summarizeDistribution(const ScalarDistribution& distribution,
+                                  bool includeHistogram)
+{
+	std::ostringstream summary;
+	summary << "count=" << distribution.count
+			<< " rms=" << distribution.rms
+			<< " p50=" << distribution.p50
+			<< " p95=" << distribution.p95
+			<< " max=" << distribution.maximum;
+	if (includeHistogram) {
+		summary << " bins=";
+		for (std::size_t index = 0; index < distribution.bins.size(); ++index) {
+			if (index != 0U)
+				summary << ',';
+			summary << distribution.bins[index];
+		}
+	}
+	return summary.str();
+}
+
+std::string summarizeReasons(const FactorFamilyDiagnostics& diagnostics)
+{
+	constexpr std::size_t kMaximumReasons = 8U;
+	std::ostringstream summary;
+	std::size_t emitted = 0U;
+	std::uint64_t remaining = 0U;
+	for (const auto& reason : diagnostics.reasonCounts) {
+		if (emitted < kMaximumReasons) {
+			if (emitted != 0U)
+				summary << ',';
+			summary << reason.first << '=' << reason.second;
+			++emitted;
+		} else {
+			remaining += reason.second;
+		}
+	}
+	if (remaining != 0U)
+		summary << ",other=" << remaining;
+	return summary.str();
+}
+
+void logDynamicDiagnostics(const BackendMapDiagnostics& diagnostics)
+{
+	RCLCPP_INFO(
+		rclcpp::get_logger("aqua_slam"),
+		"dynamic local BA diagnostics watermark={keyframe=%lu timestamp=%.9f map_version=%lu} "
+		"source={map_id=%lu topology=%lu} stereo={attempted=%lu accepted=%lu rejected=%lu deferred=%lu reasons=[%s]} "
+		"residual={%s} nis={%s} disparity={%s} skew={%s} quality={%s} degree={%s} "
+		"optional_sensors={dvl=%s pressure=%s}",
+		static_cast<unsigned long>(diagnostics.capturedWatermark.keyframeId),
+		diagnostics.capturedWatermark.timestampSec,
+		static_cast<unsigned long>(diagnostics.capturedWatermark.mapVersion),
+		static_cast<unsigned long>(diagnostics.sourceMapId),
+		static_cast<unsigned long>(diagnostics.sourceTopologySignature),
+		static_cast<unsigned long>(diagnostics.stereo.attempted),
+		static_cast<unsigned long>(diagnostics.stereo.accepted),
+		static_cast<unsigned long>(diagnostics.stereo.rejected),
+		static_cast<unsigned long>(diagnostics.stereo.deferred),
+		summarizeReasons(diagnostics.stereo).c_str(),
+		summarizeDistribution(diagnostics.stereoResidual, false).c_str(),
+		summarizeDistribution(diagnostics.stereoNis, false).c_str(),
+		summarizeDistribution(diagnostics.stereoDisparity, false).c_str(),
+		summarizeDistribution(diagnostics.stereoSkew, false).c_str(),
+		summarizeDistribution(diagnostics.stereoQuality, false).c_str(),
+		summarizeDistribution(diagnostics.landmarkObservationDegree, true).c_str(),
+		diagnostics.dvlEnabled ? "enabled" : "disabled",
+		diagnostics.pressureEnabled ? "enabled" : "disabled");
+}
+}  // namespace
 
 LocalMapping::LocalMapping(System *pSys,
 						   Atlas *pAtlas,
 						   DenseMapper* pDenseMapper,
-						   const float bMonocular,
-						   bool bInertial,
-						   bool bDvlGyro,
-						   const string &strSettingPath)
+							   const float bMonocular,
+							   bool bInertial,
+							   bool bDvlGyro,
+							   NeuralFeatureFrontend* featureFrontend,
+							   const string &strSettingPath)
 	:
 	mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false),
+	mpFeatureFrontend(featureFrontend),
 	mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
 	mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true),
 	mbNewInit(false), mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0),
@@ -95,6 +170,109 @@ void LocalMapping::SetTracker(Tracking *pTracker)
 	mpTracker = pTracker;
 }
 
+std::unique_lock<std::recursive_timed_mutex> LocalMapping::AcquireDynamicCommitTransaction()
+{
+	auto transaction = mpTracker->TryAcquireDynamicMapTransaction();
+	while (true) {
+		bool resetRequested;
+		{
+			std::lock_guard<std::mutex> lock(mMutexReset);
+			resetRequested = mbResetRequested || mbResetRequestedActiveMap;
+		}
+		if (resetRequested || stopRequested() || CheckFinish())
+			return {};
+		if (transaction.owns_lock())
+			return transaction;
+		// Preserve validated BA work during frame ingestion, but let reset/stop
+		// acknowledgements proceed without waiting for Tracking's transaction.
+		transaction.try_lock_for(std::chrono::milliseconds(5));
+	}
+}
+
+bool LocalMapping::OptimizeLocalMapWithDynamicBackend(Map* map)
+{
+	if (!map)
+		return false;
+	DynamicLocalOptimizationTransaction transaction;
+	if (!transaction.MayStartSolve(mbAbortBA))
+		return false;
+
+	if (!mpTracker)
+		return false;
+	CommittedKeyframeWatermark watermark;
+	if (!mpTracker->CaptureCommittedKeyframeWatermark(&watermark))
+		return false;
+	const std::uint64_t version =
+		static_cast<std::uint64_t>(map->GetMapChangeIndex());
+	const BackendMapSnapshot fullSnapshot =
+		GtsamMapAdapter::snapshot(*map, version);
+	BackendMapSnapshot snapshot;
+	std::string projectionReason;
+	if (!GtsamMapAdapter::projectCommitted(
+			fullSnapshot, watermark, &snapshot, &projectionReason)) {
+		mpTracker->RecordGtsamRebaseProjectionRejected(projectionReason);
+		return false;
+	}
+	// Retained graph landmarks can survive their original stereo keyframes.
+	snapshot.landmarks = fullSnapshot.landmarks;
+	if (!transaction.MayStartSolve(mbAbortBA))
+		return false;
+
+	const auto started = std::chrono::steady_clock::now();
+	const auto prepared = mpTracker->PrepareDynamicMapOptimization(snapshot);
+	if (!prepared)
+		return false;
+	const BackendMapResult result = prepared->result();
+	const double elapsedMs = std::chrono::duration<double, std::milli>(
+		std::chrono::steady_clock::now() - started).count();
+		const BackendMapResultValidation validation =
+			GtsamMapAdapter::validateMapResult(
+				snapshot, result);
+	RCLCPP_INFO(rclcpp::get_logger("aqua_slam"),
+		"dynamic local BA optimized=%d validated=%d keyframes=%zu landmarks=%zu observations=%zu "
+			"elapsed_ms=%.1f max_pose_shift_m=%.6f max_pose_rotation_rad=%.6f "
+			"landmark_shift_p95_m=%.6f max_landmark_shift_m=%.6f",
+		result.accepted ? 1 : 0, validation.accepted ? 1 : 0,
+		result.keyframes.size(), result.landmarks.size(),
+		snapshot.observations.size(), elapsedMs,
+			validation.maximumPoseTranslation,
+			validation.maximumPoseRotation,
+			validation.landmarkTranslationP95,
+			validation.maximumLandmarkTranslation);
+	transaction.MarkResultValidation(validation.accepted);
+	if (!validation.accepted) {
+		RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+			"discarded implausible dynamic local BA result (version=%lu)",
+			static_cast<unsigned long>(version));
+		return false;
+	}
+	if (!transaction.MayCommitValidatedResult(stopRequested()))
+		return false;
+
+	// Hold through frame synchronization, watermark advance and graph commit.
+	// The expensive BA solve above does not block frame ingestion.
+	auto mapTransaction = AcquireDynamicCommitTransaction();
+	if (!mapTransaction.owns_lock())
+		return false;
+	if (!mpTracker->CommitDynamicMapOptimization(
+			*prepared, *map, version, mpCurrentKeyFrame)) {
+		RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+			"discarded stale or invalid dynamic local BA result (version=%lu)",
+			static_cast<unsigned long>(version));
+		return false;
+	}
+	mpTracker->RecordGtsamRebaseSucceeded();
+	BackendMapDiagnostics diagnostics = result.diagnostics;
+	diagnostics.capturedWatermark = watermark;
+	diagnostics.sourceMapId = snapshot.mapId;
+	diagnostics.sourceTopologySignature = snapshot.topologySignature;
+	diagnostics.dvlEnabled = mbDvlGyro;
+	diagnostics.pressureEnabled = false;
+	mpTracker->RecordDynamicDiagnostics(diagnostics);
+	logDynamicDiagnostics(diagnostics);
+	return true;
+}
+
 void LocalMapping::Run()
 {
 
@@ -132,7 +310,7 @@ void LocalMapping::Run()
 			// # localMPs in LBA
 			// # fixedKFs in LBA
 
-			mbAbortBA = false;
+			mbAbortBA.store(false);
             // current_KF_num = mpAtlas->GetAllKeyFramesinAllMap().size();
 
 			if (!CheckNewKeyFrames()) {
@@ -140,74 +318,27 @@ void LocalMapping::Run()
 				SearchInNeighbors();
 			}
 			//--
-			int num_FixedKF_BA = 0;
-
 			if (!CheckNewKeyFrames() && !stopRequested()) {
 				if (mpAtlas->KeyFramesInMap() >= 2) {
 					if (mbInertial) {
-						if (mpCurrentKeyFrame->GetMap()->isImuInitialized()) {
-							Optimizer::LocalInertialBA(mpCurrentKeyFrame,
-							                           &mbAbortBA,
-							                           mpCurrentKeyFrame->GetMap());
-						}
-						else if (mpAtlas->KeyFramesInMap() > 2) {
-							Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,
-							                                 &mbAbortBA,
-							                                 mpCurrentKeyFrame->GetMap(),
-							                                 num_FixedKF_BA);
-						}
-					}
-					else if (mbDvlGyro) {
-						if (mpAtlas->IsIMUCalibrated()) {
-							DvlGyroOptimizer::LocalDVLIMUBundleAdjustment(mpAtlas,
-							                                                  mpCurrentKeyFrame,
-							                                                  &mbAbortBA,
-							                                                  mpCurrentKeyFrame->GetMap(),
-							                                                  num_FixedKF_BA,
-							                                                  mpTracker->mlamda_DVL,
-							                                                  mpTracker->mlamda_visual);
-							mpTracker->UpdateFrameDVLGyro(mpCurrentKeyFrame->GetImuBias(),
-							                                  mpCurrentKeyFrame);
-						}
-						else if (mpAtlas->KeyFramesInMap() > 2) {
-							Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,
-							                                 &mbAbortBA,
-							                                 mpCurrentKeyFrame->GetMap(),
-							                                 num_FixedKF_BA);
+						Map* map = mpCurrentKeyFrame->GetMap();
+						if (usesDynamicBackend(
+								mpTracker->backendMode(),
+								OptimizationStage::LocalBundleAdjustment)) {
+							OptimizeLocalMapWithDynamicBackend(map);
 						}
 					}
 					else if (mpAtlas->KeyFramesInMap() > 2) {
-						Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,
-						                                 &mbAbortBA,
-						                                 mpCurrentKeyFrame->GetMap(),
-						                                 num_FixedKF_BA);
+						Map* map = mpCurrentKeyFrame->GetMap();
+						if (mpTracker->backendMode() == BackendMode::GtsamDynamic) {
+							OptimizeLocalMapWithDynamicBackend(map);
+						}
 					}
 				}
 
 				if (mpTracker->mState == Tracking::OK) {
 					if (mbInertial) {
-						Map* pCurrentMap = mpCurrentKeyFrame->GetMap();
-						if (!pCurrentMap->isImuInitialized()) {
-							InitializeIMU();
-						}
-						else {
-							const double elapsed = mpCurrentKeyFrame->mTimeStamp - mFirstTs;
-							switch (NextInertialRefinementStage(
-								elapsed,
-								pCurrentMap->GetIniertialBA1(),
-								pCurrentMap->GetIniertialBA2())) {
-							case InertialRefinementStage::BA1:
-								InitializeIMU(1.0F, 1.0e5F, true);
-								pCurrentMap->SetIniertialBA1();
-								break;
-							case InertialRefinementStage::BA2:
-								InitializeIMU(0.0F, 0.0F, true);
-								pCurrentMap->SetIniertialBA2();
-								break;
-							case InertialRefinementStage::None:
-								break;
-							}
-						}
+						// Tracking owns GTSAM initialization and frame refinement.
 					}
 					else if (mbDvlGyro) {
 						if (mpAtlas->GetAllMaps().size() == 1) {
@@ -289,7 +420,7 @@ void LocalMapping::InsertKeyFrame(KeyFrame *pKF)
 {
 	unique_lock<mutex> lock(mMutexNewKFs);
 	mlNewKeyFrames.push_back(pKF);
-	mbAbortBA = true;
+	mbAbortBA.store(true);
 }
 
 bool LocalMapping::CheckNewKeyFrames()
@@ -306,9 +437,6 @@ void LocalMapping::ProcessNewKeyFrame()
 		mpCurrentKeyFrame = mlNewKeyFrames.front();
 		mlNewKeyFrames.pop_front();
 	}
-
-	// Compute Bags of Words structures
-	mpCurrentKeyFrame->ComputeBoW();
 
 	// Associate MapPoints to the new keyframe and update normal and descriptor
 	const vector<MapPoint *> vpMapPointMatches = mpCurrentKeyFrame->GetMapPointMatches();
@@ -414,7 +542,9 @@ void LocalMapping::CreateNewMapPoints()
 
 	float th = 0.6f;
 
-	ORBmatcher matcher(th, false);
+	if (!mpFeatureFrontend)
+		throw std::runtime_error("LocalMapping requires the neural feature frontend");
+	FeatureMatcher matcher(*mpFeatureFrontend, th);
 
 	cv::Mat Rcw1 = mpCurrentKeyFrame->GetRotation();
 	cv::Mat Rwc1 = Rcw1.t();
@@ -470,7 +600,8 @@ void LocalMapping::CreateNewMapPoints()
 		bool bCoarse = mbInertial &&
 			((!mpCurrentKeyFrame->GetMap()->GetIniertialBA2() && mpCurrentKeyFrame->GetMap()->GetIniertialBA1()) ||
 				mpTracker->mState == Tracking::RECENTLY_LOST);
-		matcher.SearchForTriangulation(mpCurrentKeyFrame, pKF2, F12, vMatchedIndices, false, bCoarse);
+		matcher.SearchForNeuralTriangulation(
+			mpCurrentKeyFrame, pKF2, F12, vMatchedIndices, false);
 
 		cv::Mat Rcw2 = pKF2->GetRotation();
 		cv::Mat Rwc2 = Rcw2.t();
@@ -773,7 +904,7 @@ void LocalMapping::SearchInNeighbors()
 			vpTargetKFs.push_back(pKFi2);
 			pKFi2->mnFuseTargetForKF = mpCurrentKeyFrame->mnId;
 		}
-		if (mbAbortBA) {
+		if (mbAbortBA.load()) {
 			break;
 		}
 	}
@@ -793,7 +924,7 @@ void LocalMapping::SearchInNeighbors()
 	}
 
 	// Search matches by projection from current KF in target KFs
-	ORBmatcher matcher;
+	FeatureMatcher matcher(*mpFeatureFrontend);
 	vector<MapPoint *> vpMapPointMatches = mpCurrentKeyFrame->GetMapPointMatches();
 	for (vector<KeyFrame *>::iterator vit = vpTargetKFs.begin(), vend = vpTargetKFs.end(); vit != vend; vit++) {
 		KeyFrame *pKFi = *vit;
@@ -802,7 +933,7 @@ void LocalMapping::SearchInNeighbors()
 		if (pKFi->NLeft != -1) { matcher.Fuse(pKFi, vpMapPointMatches, true); }
 	}
 
-	if (mbAbortBA) {
+	if (mbAbortBA.load()) {
 		return;
 	}
 
@@ -874,7 +1005,7 @@ void LocalMapping::RequestStop()
 	unique_lock<mutex> lock(mMutexStop);
 	mbStopRequested = true;
 	unique_lock<mutex> lock2(mMutexNewKFs);
-	mbAbortBA = true;
+	mbAbortBA.store(true);
 }
 
 bool LocalMapping::Stop()
@@ -944,7 +1075,7 @@ bool LocalMapping::SetNotStop(bool flag)
 
 void LocalMapping::InterruptBA()
 {
-	mbAbortBA = true;
+	mbAbortBA.store(true);
 }
 
 void LocalMapping::KeyFrameCulling()
@@ -1112,7 +1243,7 @@ void LocalMapping::KeyFrameCulling()
 				pKF->SetBadFlag();
 			}
 		}
-		if ((count > 20 && mbAbortBA)
+		if ((count > 20 && mbAbortBA.load())
 			|| count > 100) // MODIFICATION originally 20 for mbabortBA check just 10 keyframes
 		{
 			break;
@@ -1335,20 +1466,9 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
 
 	mInitTime = mpTracker->mLastFrame.mTimeStamp - vpKF.front()->mTimeStamp;
 
-	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-	// set new bias for keyframes after optimization
-		Optimizer::InertialOptimization(mpAtlas->GetCurrentMap(),
-									mRwg,
-									mScale,
-									mbg,
-									mba,
-									mbMonocular,
-									infoInertial,
-									false,
-									false,
-										priorG,
-										priorA);
-		std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+	// Bias and gravity refinement are owned by the GTSAM backend.
+	(void)priorG;
+	(void)priorA;
 
 	/*cout << "scale after inertial-only optimization: " << mScale << endl;
 	cout << "bg after inertial-only optimization: " << mbg << endl;
@@ -1366,13 +1486,11 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
 	// Before this line we are not changing the map
 
 	// unique_lock<timed_mutex> lock(mpAtlas->GetCurrentMap()->mMutexMapUpdate);
-		std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
 		if ((fabs(mScale - 1.f) > 0.00001) || !mbMonocular) {
 			mpAtlas->GetCurrentMap()->ApplyScaledRotation(Converter::toCvMat(mRwg).t(), mScale, true);
 			// set new bias for last frame and current frame
 			mpTracker->UpdateFrameIMU(mScale, vpKF[0]->GetImuBias(), mpCurrentKeyFrame);
 		}
-	std::chrono::steady_clock::time_point t3 = std::chrono::steady_clock::now();
 
 	// Check if initialization OK
 	if (!mpAtlas->isImuInitialized()) {
@@ -1386,17 +1504,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
 	cout << "ba: " << mpCurrentKeyFrame->GetAccBias() << endl;
 	cout << "bg: " << mpCurrentKeyFrame->GetGyroBias() << endl;*/
 
-	std::chrono::steady_clock::time_point t4 = std::chrono::steady_clock::now();
-	if (bFIBA) {
-		if (priorA != 0.f) {
-			Optimizer::FullInertialBA(mpAtlas->GetCurrentMap(), 100, false, 0, NULL, true, priorG, priorA);
-		}
-		else {
-			Optimizer::FullInertialBA(mpAtlas->GetCurrentMap(), 100, false, 0, NULL, false);
-		}
-	}
-
-	std::chrono::steady_clock::time_point t5 = std::chrono::steady_clock::now();
+	(void)bFIBA;
 
 		// If initialization is OK
 		mpTracker->UpdateFrameIMU(1.0, vpKF[0]->GetImuBias(), mpCurrentKeyFrame);
@@ -1465,9 +1573,7 @@ void LocalMapping::ScaleRefinement()
 	mRwg = Eigen::Matrix3d::Identity();
 	mScale = 1.0;
 
-	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-	Optimizer::InertialOptimization(mpAtlas->GetCurrentMap(), mRwg, mScale);
-	std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+	// Stereo supplies metric scale; any refinement is performed transactionally by GTSAM.
 
 	if (mScale < 1e-1) // 1e-1
 	{
@@ -1490,8 +1596,6 @@ void LocalMapping::ScaleRefinement()
 		delete *lit;
 	}
 	mlNewKeyFrames.clear();
-
-	double t_inertial_only = std::chrono::duration_cast<std::chrono::duration<double> >(t1 - t0).count();
 
 	// To perform pose-inertial opt w.r.t. last keyframe
 	mpCurrentKeyFrame->GetMap()->IncreaseChangeIndex();
@@ -1581,13 +1685,8 @@ void LocalMapping::InitializeDvlGyro(float priorG, bool bFirst)
 
 	mInitTime = mpTracker->mLastFrame.mTimeStamp - vpKF.front()->mTimeStamp;
 
-	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-	// new bias has been set to all keyframes after optimization
-//	Optimizer::DvlGyroInitOptimization(mpAtlas->GetCurrentMap(), mbg, mbMonocular, priorG);
-	Optimizer::DvlGyroInitOptimization3(mpAtlas->GetCurrentMap(), mbg, mbMonocular, priorG);
-//	Optimizer::DvlGyroInitOptimization6(mpAtlas->GetCurrentMap(), mbg, mbMonocular, priorG);
-//	Optimizer::DvlGyroInitOptimization5(mpAtlas->GetCurrentMap(), mbg, mbMonocular, priorG);
-	std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+	(void)priorG;
+	(void)bFirst;
 
 	// set new bias for tracking thread, update last frame and current frame pose
 //	mpTracker->mLastKfBeforeLoss=NULL;
@@ -1605,7 +1704,7 @@ void LocalMapping::InitializeDvlGyro(float priorG, bool bFirst)
 	 * 	execute a full DVL_Gyro BA after initilization
 	 */
 
-	DvlGyroOptimizer::FullDVLGyroBundleAdjustment(nullptr, mpAtlas->GetCurrentMap(), mpTracker->mlamda_DVL);
+	OptimizeLocalMapWithDynamicBackend(mpAtlas->GetCurrentMap());
 	cout<<"full BA excuted after calibration!"<<endl;
 
 	//todo_tightly
@@ -1668,20 +1767,8 @@ void LocalMapping::InitializeDvlIMU()
 	mbg = Converter::toVector3d(mpCurrentKeyFrame->GetGyroBias());
 	mba = Converter::toVector3d(mpCurrentKeyFrame->GetAccBias());
 
-	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-	// new bias has been set to all keyframes after optimization
-//	Optimizer::DvlGyroInitOptimization(mpAtlas->GetCurrentMap(), mbg, mbMonocular, priorG);
-    double clib_avg_error = 0;
-    if(dis.first<mInitTranslationThred||dis.second<mInitRotationThred){
-        clib_avg_error = Optimizer::DvlIMUInitOptimization(mpAtlas->GetCurrentMap(),1e2,1e8);
-    }
-    else{
-        clib_avg_error = Optimizer::DvlIMUInitOptimization(mpAtlas->GetCurrentMap(),1,1e6);
-    }
-
-//	Optimizer::DvlGyroInitOptimization6(mpAtlas->GetCurrentMap(), mbg, mbMonocular, priorG);
-//	Optimizer::DvlGyroInitOptimization5(mpAtlas->GetCurrentMap(), mbg, mbMonocular, priorG);
-	std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+	// DVL is optional; GTSAM consumes it as a measurement when present.
+	const double clib_avg_error = 0.0;
 
     auto all_kf = mpAtlas->GetAllKeyFrames();
     if(clib_avg_error<0.01&&(all_kf.size()>20)){
@@ -1766,7 +1853,8 @@ void LocalMapping::RefineGravityDvlIMU()
         return;
     }
 
-    Optimizer::DvlIMURefineOptimization(mpAtlas);
+    if (mpCurrentKeyFrame)
+        OptimizeLocalMapWithDynamicBackend(mpCurrentKeyFrame->GetMap());
 
     // mpTracker->mpRosHandler->UpdateMap(mpAtlas);
     // mpTracker->mpRosHandler->PublishIntegration(mpAtlas);
@@ -1774,13 +1862,8 @@ void LocalMapping::RefineGravityDvlIMU()
 
 void LocalMapping::FullBA()
 {
-    DvlGyroOptimizer::FullDVLIMUBundleAdjustment(mpAtlas,
-                                                 mpCurrentKeyFrame,
-                                                 &mbAbortBA,
-                                                 mpCurrentKeyFrame->GetMap(),
-                                                 10,
-                                                 mpTracker->mlamda_DVL,
-                                                 mpTracker->mlamda_visual);
+    if (mpCurrentKeyFrame)
+        OptimizeLocalMapWithDynamicBackend(mpCurrentKeyFrame->GetMap());
 }
 
 std::pair<double,double> LocalMapping::GetTravelDistance()

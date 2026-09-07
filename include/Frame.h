@@ -22,14 +22,13 @@
 
 //#define SAVE_TIMES
 
-#include<vector>
-
-#include "Thirdparty/DBoW2/DBoW2/BowVector.h"
-#include "Thirdparty/DBoW2/DBoW2/FeatureVector.h"
+#include <iostream>
+#include <map>
+#include <string>
+#include <vector>
 
 #include "ImuTypes.h"
-#include "ORBVocabulary.h"
-#include "SuperPointExtractor.h"
+#include "NeuralFeatureFrontend.h"
 #include <DVLGroPreIntegration.h>
 
 #include <mutex>
@@ -37,6 +36,12 @@
 
 namespace ORB_SLAM3
 {
+using std::cout;
+using std::endl;
+using std::map;
+using std::string;
+using std::vector;
+
 #define FRAME_GRID_ROWS 48
 #define FRAME_GRID_COLS 64
 
@@ -44,7 +49,6 @@ class MapPoint;
 class KeyFrame;
 class ConstraintPoseImu;
 class GeometricCamera;
-class ORBextractor;
 
 class Frame
 {
@@ -55,18 +59,23 @@ public:
     Frame(const Frame &frame);
 
 	// Constructor for tightly coupled stereo-gro-dvl.
-	Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeStamp, ORBextractor* extractorLeft, ORBextractor* extractorRight, ORBVocabulary* voc, cv::Mat &K, cv::Mat &distCoef, const float &bf, const float &thFarDepth, const float &thCloseDepth, GeometricCamera* pCamera, bool bDVL, Frame* pPrevF = static_cast<Frame*>(NULL), const IMU::Calib &ImuCalib = IMU::Calib());
+	Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeStamp,
+	      NeuralFeatureFrontend &featureFrontend,
+	      cv::Mat &K, cv::Mat &distCoef, const float &bf,
+	      const float &thFarDepth, const float &thCloseDepth,
+	      const float &stereoMaxVerticalError, GeometricCamera* pCamera,
+	      bool bDVL, Frame* pPrevF = static_cast<Frame*>(NULL),
+	      const IMU::Calib &ImuCalib = IMU::Calib());
 
     // Destructor
     // ~Frame();
 
-    // Extract ORB on the image. 0 for left image and 1 for right image.
-    void ExtractORB(int flag, const cv::Mat &im, const int x0, const int x1);
-    bool ExtractSuperPointStereo(const cv::Mat &imLeftGray, const cv::Mat &imRightGray);
-    static void SetSharedSuperPoint(SuperPointExtractor* extractor);
-
-    // Compute Bag of Words representation.
-    void ComputeBoW();
+    void ExtractNeuralStereo(const cv::Mat &imLeftGray,
+                             const cv::Mat &imRightGray,
+                             NeuralFeatureFrontend &featureFrontend,
+                             float stereoMaxVerticalError);
+    int TransferTemporalMapPoints(const Frame& previous,
+                                  const std::vector<NeuralMatch>& inliers);
 
     // Set the camera pose. (Imu pose is not modified!)
     void SetPose(cv::Mat Tcw);
@@ -103,7 +112,7 @@ public:
 
 	cv::Mat GetDvlPosition();
 	cv::Mat GetDvlRotation();
-	cv::Mat GetDvlVelocity();
+	cv::Mat GetDvlVelocity() const;
 	cv::Mat GetGyroRotation();
 
     void SetNewBias(const IMU::Bias &b);
@@ -120,10 +129,6 @@ public:
     bool PosInGrid(const cv::KeyPoint &kp, int &posX, int &posY);
 
     vector<size_t> GetFeaturesInArea(const float &x, const float  &y, const float  &r, const int minLevel=-1, const int maxLevel=-1, const bool bRight = false) const;
-
-    // Search a match for each keypoint in the left image to a keypoint in the right image.
-    // If there is a match, depth is computed and the right coordinate associated to the left keypoint is stored.
-    void ComputeStereoMatches();
 
     // UW_SLAM seam: overwrite stereo geometry from external LEFT↔RIGHT matches.
     void ApplyExternalStereoMatches(const std::vector<cv::Point2f>& vLeft,
@@ -149,12 +154,6 @@ public:
     // c0_t_c0_cj
     cv::Mat mOw;
 public:
-    // Vocabulary used for relocalization.
-    ORBVocabulary* mpORBvocabulary;
-
-    // Feature extractor. The right is used only in the stereo case.
-    ORBextractor* mpORBextractorLeft, *mpORBextractorRight;
-
     // Frame timestamp.
     double mTimeStamp;
 
@@ -194,11 +193,7 @@ public:
     std::vector<float> mvuRight;
     std::vector<float> mvDepth;
 
-    // Bag of Words Vector structures.
-    DBoW2::BowVector mBowVec;
-    DBoW2::FeatureVector mFeatVec;
-
-    // ORB descriptor, each row associated to a keypoint.
+    // Normalized SuperPoint descriptor, one CV_32F row per keypoint.
     cv::Mat mDescriptors, mDescriptorsRight;
 
     // MapPoints associated to keypoints, NULL pointer if no association.
@@ -277,7 +272,7 @@ public:
     int mnDataset;
 
     double mTimeStereoMatch;
-    double mTimeORB_Ext;
+    double mTimeFeatureExtraction;
 
     // DVL EKF
     Eigen::Isometry3d mT_e0_ej;
@@ -334,11 +329,7 @@ public:
     //For stereo matching
     std::vector<int> mvLeftToRightMatch, mvRightToLeftMatch;
 
-    //For stereo fisheye matching
-    static cv::BFMatcher BFmatcher;
-
-    //Triangulated stereo observations using as reference the left camera. These are
-    //computed during ComputeStereoFishEyeMatches
+    // Triangulated stereo observations using the left camera as reference.
     std::vector<cv::Mat> mvStereo3Dpoints;
 
     //Grid for the right image
@@ -346,19 +337,12 @@ public:
 
     cv::Mat mTlr, mRlr, mtlr, mTrl;
 
-    Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeStamp, ORBextractor* extractorLeft, ORBextractor* extractorRight, ORBVocabulary* voc, cv::Mat &K, cv::Mat &distCoef, const float &bf, const float &thDepth, GeometricCamera* pCamera, GeometricCamera* pCamera2, cv::Mat& Tlr,Frame* pPrevF = static_cast<Frame*>(NULL), const IMU::Calib &ImuCalib = IMU::Calib());
-
-    //Stereo fisheye
-    void ComputeStereoFishEyeMatches();
-
     bool isInFrustumChecks(MapPoint* pMP, float viewingCosLimit, bool bRight = false);
 
     cv::Mat UnprojectStereoFishEye(const int &i);
 
     cv::Mat imgLeft, imgRight;
     cv::Mat imgDepthScaled; // UW_SLAM: metric CV_32FC1 depth, empty if unused
-
-    static SuperPointExtractor* mpSharedSuperPoint;
 
     void PrintPointDistribution(){
         int left = 0, right = 0;

@@ -24,6 +24,7 @@
 #include "Initializer.h"
 #include "RosHandling.h"
 
+#include <atomic>
 #include <mutex>
 
 
@@ -37,11 +38,40 @@ class LoopClosing;
 class Atlas;
 class KeyFrameDatabase;
 class DenseMapper;
+class NeuralFeatureFrontend;
+
+// A Local Mapping scheduling abort can cancel work only before solve begins.
+// Once snapshot-bound result validation succeeds, commit guards own rejection.
+class DynamicLocalOptimizationTransaction
+{
+public:
+    bool MayStartSolve(const std::atomic_bool& abortRequested) const noexcept
+    {
+        return !abortRequested.load();
+    }
+
+    void MarkResultValidation(bool accepted) noexcept
+    {
+        mbResultValidated = accepted;
+    }
+
+    bool MayCommitValidatedResult(bool stopRequested) const noexcept
+    {
+        return mbResultValidated && !stopRequested;
+    }
+
+private:
+    bool mbResultValidated = false;
+};
 
 class LocalMapping
 {
+    friend class LocalMappingTestAccess;
 public:
-    LocalMapping(System* pSys, Atlas* pAtlas, DenseMapper* pDenseMapper, const float bMonocular, bool bInertial, bool bDvlGyro, const string &strSettingPath=std::string());
+    LocalMapping(System* pSys, Atlas* pAtlas, DenseMapper* pDenseMapper,
+                 const float bMonocular, bool bInertial, bool bDvlGyro,
+                 NeuralFeatureFrontend* featureFrontend,
+                 const string &strSettingPath=std::string());
 
     void SetLoopCloser(LoopClosing* pLoopCloser);
 
@@ -112,9 +142,13 @@ public:
     float mThFarPoints;
 protected:
 
+    LocalMapping() = default;
+    std::unique_lock<std::recursive_timed_mutex> AcquireDynamicCommitTransaction();
+
     bool CheckNewKeyFrames();
     void ProcessNewKeyFrame();
     void CreateNewMapPoints();
+    bool OptimizeLocalMapWithDynamicBackend(Map* map);
 
     void MapPointCulling();
     void SearchInNeighbors();
@@ -146,6 +180,7 @@ protected:
     Atlas* mpAtlas;
 
     LoopClosing* mpLoopCloser;
+    NeuralFeatureFrontend* mpFeatureFrontend;
     Tracking* mpTracker;
 
     std::list<KeyFrame*> mlNewKeyFrames;
@@ -156,7 +191,7 @@ protected:
 
     std::mutex mMutexNewKFs;
 
-    bool mbAbortBA;
+    std::atomic_bool mbAbortBA;
 
     bool mbStopped;
     bool mbStopRequested;

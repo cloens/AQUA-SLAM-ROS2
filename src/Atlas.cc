@@ -23,7 +23,7 @@
 #include "GeometricCamera.h"
 #include "Pinhole.h"
 #include "KannalaBrandt8.h"
-#include "KeyFrameDatabase.h"
+#include "KeyFrameRegistry.h"
 
 #include <opencv2/core.hpp>
 #include <Eigen/Core>
@@ -376,14 +376,13 @@ void Atlas::PostLoad()
 	for(Map* pMi : mvpBackupMaps){
 		pMi->PostLoadKFID(mpAllKeyFrameId);
 	}
-	mpKeyFrameDB->SetORBVocabulary(mpORBVocabulary);
 	mpKeyFrameDB->PostLoad(mpAllKeyFrameId);
     for(Map* pMi : mvpBackupMaps)
     {
         cout << "Map id:" << pMi->GetId() << endl;
         mspMaps.insert(pMi);
         map<long unsigned int, KeyFrame*> mpKeyFrameId;
-        pMi->PostLoad(mpKeyFrameDB, mpORBVocabulary, mpKeyFrameId, mpCams);
+        pMi->PostLoad(mpKeyFrameDB, mpKeyFrameId, mpCams);
         mpAllKeyFrameId.insert(mpKeyFrameId.begin(), mpKeyFrameId.end());
         numKF += pMi->GetAllKeyFrames().size();
 	    for(auto pKF:(pMi->GetAllKeyFrames())){
@@ -408,16 +407,6 @@ void Atlas::SetKeyFrameDababase(KeyFrameDatabase* pKFDB)
 KeyFrameDatabase* Atlas::GetKeyFrameDatabase()
 {
     return mpKeyFrameDB;
-}
-
-void Atlas::SetORBVocabulary(ORBVocabulary* pORBVoc)
-{
-    mpORBVocabulary = pORBVoc;
-}
-
-ORBVocabulary* Atlas::GetORBVocabulary()
-{
-    return mpORBVocabulary;
 }
 
 long unsigned int Atlas::GetNumLivedKF()

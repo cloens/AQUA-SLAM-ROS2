@@ -18,7 +18,7 @@
 
 #include "TwoViewReconstruction.h"
 
-#include "Thirdparty/DBoW2/DUtils/Random.h"
+#include "Random.h"
 
 #include<thread>
 
@@ -76,7 +76,7 @@ bool TwoViewReconstruction::Reconstruct(const std::vector<cv::KeyPoint>& vKeys1,
     // Generate sets of 8 points for each RANSAC iteration
     mvSets = vector< vector<size_t> >(mMaxIterations,vector<size_t>(8,0));
 
-    DUtils::Random::SeedRandOnce(0);
+    SeedRandomOnce(0U);
 
     for(int it=0; it<mMaxIterations; it++)
     {
@@ -85,7 +85,7 @@ bool TwoViewReconstruction::Reconstruct(const std::vector<cv::KeyPoint>& vKeys1,
         // Select a minimum set
         for(size_t j=0; j<8; j++)
         {
-            int randi = DUtils::Random::RandomInt(0,vAvailableIndices.size()-1);
+            int randi = RandomInt(0,vAvailableIndices.size()-1);
             int idx = vAvailableIndices[randi];
 
             mvSets[it][j] = idx;

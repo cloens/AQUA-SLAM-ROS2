@@ -17,7 +17,7 @@
 */
 
 #include "MapPoint.h"
-#include "ORBmatcher.h"
+#include "FeatureMatcher.h"
 
 #include <mutex>
 #include <cmath>
@@ -395,14 +395,14 @@ namespace ORB_SLAM3
             Distances[i][i] = 0;
             for (size_t j = i + 1; j < N; j++)
             {
-                int distij = ORBmatcher::DescriptorDistance(vDescriptors[i], vDescriptors[j]);
+                float distij = FeatureMatcher::DescriptorDistance(vDescriptors[i], vDescriptors[j]);
                 Distances[i][j] = distij;
                 Distances[j][i] = distij;
             }
         }
 
         // Take the descriptor with least median distance to the rest
-        int BestMedian = INT_MAX;
+        float BestMedian = std::numeric_limits<float>::infinity();
         int BestIdx = 0;
         for (size_t i = 0; i < N; i++)
         {

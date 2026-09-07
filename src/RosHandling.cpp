@@ -8,12 +8,14 @@
 #include "Map.h"
 #include "System.h"
 #include "LocalMapping.h"
+#include "MotionModelPose.h"
 // #include "visualization_msgs/Marker.h"  // original
 #include <visualization_msgs/msg/marker.hpp>
 #include <chrono>
 #include <cmath>
 #include <fstream>
 #include <thread>
+#include <unordered_map>
 
 using namespace ORB_SLAM3;
 using namespace std;
@@ -41,8 +43,10 @@ bool IsFiniteVelocity(const cv::Mat &velocity)
 
 // RosHandling::RosHandling(System *pSys, LocalMapping *pLocal)  // original
 // 	: mp_system(pSys),mp_LocalMapping(pLocal)  // original
-RosHandling::RosHandling(System *pSys, LocalMapping *pLocal, rclcpp::Node::SharedPtr node)
-	: mp_system(pSys), mp_LocalMapping(pLocal), mp_node(node)
+RosHandling::RosHandling(System *pSys, LocalMapping *pLocal,
+                         rclcpp::Node::SharedPtr node, bool dynamicBackend)
+	: mp_system(pSys), mp_LocalMapping(pLocal), mp_node(node),
+	  mDynamicBackend(dynamicBackend)
 {
 // // 	ros::NodeHandle nh_;  // original  // original
 	mp_it = std::make_shared<image_transport::ImageTransport>(mp_node);
@@ -351,15 +355,21 @@ void RosHandling::PublishOrb(const Eigen::Isometry3d &T_c0_cj_orb,
 void RosHandling::UpdateMap(ORB_SLAM3::Atlas *pAtlas)
 {
 	const std::lock_guard<std::mutex> guard(m_mutex_map);
-    if(!pAtlas->isImuInitialized()){
-        return;
-    }
+	Map *activeMap = pAtlas->GetCurrentMap();
+	const bool hasActiveKeyframes =
+		activeMap && !activeMap->GetAllKeyFrames().empty();
+	if (!CanPublishEstimatorOutputs(mDynamicBackend,
+	                                pAtlas->isImuInitialized(),
+	                                hasActiveKeyframes)) {
+	        return;
+	    }
+	vector<Map *> allMaps{activeMap};
 //	pcl::PointCloud<pcl::PointXYZRGB> cloud;
 //	octomap::OcTree tree(0.1);
 	mp_cloud_occupied->clear();
 	mp_cloud_free->clear();
 	mp_octree->clear();
-    Map* p_first_map = pAtlas->GetAllMaps().front();
+	    Map* p_first_map = activeMap;
     Eigen::Matrix3d R_b0_w = pAtlas->getRGravity();
     cv::Mat T_imu_c_cv = p_first_map->GetOriginKF()->mImuCalib.mT_imu_c.clone();
     cv::Mat T_d_c = p_first_map->GetOriginKF()->mImuCalib.mT_dvl_c.clone();
@@ -397,7 +407,6 @@ void RosHandling::UpdateMap(ORB_SLAM3::Atlas *pAtlas)
     mT_w_c0 = T_w_c0;
 // //    ROS_INFO_STREAM("pub T_w_c0: \n"<<T_w_c0.matrix());  // original
 
-	vector<Map *> allMaps = pAtlas->GetAllMaps();
 	for (vector<Map *>::iterator it = allMaps.begin(); it != allMaps.end(); it++) {
 		Map *pMap = *it;
         // Eigen::Matrix3d R_b0_w = pAtlas->getRGravity();
@@ -651,18 +660,23 @@ double RosHandling::LinearInterpolation(double start_x, double end_x, double sta
 }
 void RosHandling::PublishIntegration(Atlas *pAtlas)
 {
-    if(!pAtlas->isImuInitialized()){
-        return;
-    }
-    auto maps = pAtlas->GetAllMaps();
+	    Map *activeMap = pAtlas->GetCurrentMap();
+	    const bool hasActiveKeyframes =
+	        activeMap && !activeMap->GetAllKeyFrames().empty();
+	    if (!CanPublishEstimatorOutputs(mDynamicBackend,
+	                                    pAtlas->isImuInitialized(),
+	                                    hasActiveKeyframes)) {
+	        return;
+	    }
+	    const vector<Map *> maps{activeMap};
     set<KeyFrame*,KFComparator> all_kf;
     visualization_msgs::msg::MarkerArray all_markers;
     m_integration_path.poses.clear();
     m_path_orb.poses.clear();
     m_path_orb_body.poses.clear();
     m_ref_integration_path.poses.clear();
-    cv::Mat T_d_c_cv = maps.front()->GetOriginKF()->mImuCalib.mT_dvl_c.clone();
-    cv::Mat T_g_d_cv = maps.front()->GetOriginKF()->mImuCalib.mT_imu_dvl.clone();
+	    cv::Mat T_d_c_cv = activeMap->GetOriginKF()->mImuCalib.mT_dvl_c.clone();
+	    cv::Mat T_g_d_cv = activeMap->GetOriginKF()->mImuCalib.mT_imu_dvl.clone();
     Eigen::Isometry3d T_g_d = Eigen::Isometry3d::Identity();
     Eigen::Isometry3d T_d_c = Eigen::Isometry3d::Identity();
     cv::cv2eigen(T_g_d_cv, T_g_d.matrix());
@@ -671,15 +685,15 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
     Eigen::Matrix3d R_g_d = T_g_d.rotation();
     // handle gravity dir
     Eigen::Matrix3d R_b0_w = pAtlas->getRGravity();
-    Eigen::Isometry3d T_w_c0 = mT_w_c0;
+    const Eigen::Isometry3d T_w_c0 = mT_w_c0;
 
     for(auto pMap:maps){
         auto pKFs = pMap->GetAllKeyFrames();
-        if (pKFs.empty()) {
-            return;
-        }
-        else if (pKFs[0]->GetPoseInverse().empty()) {
-            return;
+	        if (pKFs.empty()) {
+	            continue;
+	        }
+	        else if (pKFs[0]->GetPoseInverse().empty()) {
+	            continue;
         }
 
         KeyFrame *pKF = pKFs[0];
@@ -833,7 +847,6 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
             cv::cv2eigen(T_c0_cj_orb_cv, T_c0_cj_orb.matrix());
             //		T_c0_cj_orb = T_c_enu.inverse() * T_c0_cj_orb * T_c_enu;
             Eigen::Isometry3d T_w_cj_orb = T_w_c0 * T_c0_cj_orb ;
-
             pose_to_pub.header.frame_id = "aqua_slam";
 // //             //pose_to_pub.header.stamp=ros::Time::now();  // original  // original
 // //             pose_to_pub.header.stamp = ros::Time(pKF->mTimeStamp);  // original  // original
@@ -887,7 +900,7 @@ void RosHandling::PublishIntegration(Atlas *pAtlas)
 		cv::Mat  T_c0_cj_cv = pKF->GetPoseInverse();
 		Eigen::Isometry3d T_c0_cj = Eigen::Isometry3d::Identity();
 		cv::cv2eigen(T_c0_cj_cv,T_c0_cj.matrix());
-		Eigen::Isometry3d T_w_cj = mT_w_c0 * T_c0_cj;
+		Eigen::Isometry3d T_w_cj = T_w_c0 * T_c0_cj;
 		if (!IsFiniteTransform(T_w_cj)) {
 			RCLCPP_WARN_THROTTLE(
 				mp_node->get_logger(), *mp_node->get_clock(), 5000,

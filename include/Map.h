@@ -24,10 +24,13 @@
 
 #include <set>
 #include <list>
+#include <map>
 #include <mutex>
+#include <string>
+#include <vector>
+#include <opencv2/core/core.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
-#include "ORBVocabulary.h"
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/set.hpp>
 #include <shared_mutex>
@@ -36,6 +39,10 @@
 
 namespace ORB_SLAM3
 {
+using std::map;
+using std::string;
+using std::to_string;
+using std::vector;
 
 class MapPoint;
 class KeyFrame;
@@ -161,10 +168,10 @@ public:
     unsigned int GetLowerKFID();
 
     void PreSave(std::set<GeometricCamera*> &spCams);
-    void PostLoad(KeyFrameDatabase* pKFDB, ORBVocabulary* pORBVoc, map<long unsigned int, KeyFrame*>& mpKeyFrameId, map<unsigned int, GeometricCamera*> &mpCams);
+    void PostLoad(KeyFrameDatabase* pKFDB, map<long unsigned int, KeyFrame*>& mpKeyFrameId, map<unsigned int, GeometricCamera*> &mpCams);
 	void PostLoadKFID(map<long unsigned int, KeyFrame*>& mpKeyFrameId);
 
-    void printReprojectionError(list<KeyFrame*> &lpLocalWindowKFs, KeyFrame* mpCurrentKF, string &name, string &name_folder);
+    void printReprojectionError(std::list<KeyFrame*> &lpLocalWindowKFs, KeyFrame* mpCurrentKF, std::string &name, std::string &name_folder);
 
     vector<KeyFrame*> mvpKeyFrameOrigins;
     vector<unsigned long int> mvBackupKeyFrameOriginsId;

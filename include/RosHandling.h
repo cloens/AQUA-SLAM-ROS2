@@ -95,7 +95,8 @@ class RosHandling
 {
 public:
 	// RosHandling(System *pSys, LocalMapping *pLocal);  // original
-	RosHandling(System *pSys, LocalMapping *pLocal, rclcpp::Node::SharedPtr node);
+	RosHandling(System *pSys, LocalMapping *pLocal, rclcpp::Node::SharedPtr node,
+	            bool dynamicBackend);
 	void PublishLeftImg(const sensor_msgs::msg::Image::SharedPtr &img);
 	void PublishRightImg(const sensor_msgs::msg::Image::SharedPtr &img);
 	void PublishImgWithInfo(const sensor_msgs::msg::Image::SharedPtr &img);
@@ -136,6 +137,7 @@ protected:
 	System *mp_system;
 	LocalMapping *mp_LocalMapping;
 	rclcpp::Node::SharedPtr mp_node;
+	bool mDynamicBackend = false;
 
 	std::shared_ptr<image_transport::ImageTransport> mp_it;
 	std::shared_ptr<image_transport::Publisher> mp_img_l_pub;

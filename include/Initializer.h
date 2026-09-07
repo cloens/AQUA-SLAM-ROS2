@@ -33,7 +33,7 @@ class Map;
 // THIS IS THE INITIALIZER FOR MONOCULAR SLAM. NOT USED IN THE STEREO OR RGBD CASE.
 class Initializer
 {
-    typedef pair<int,int> Match;
+    typedef std::pair<int,int> Match;
 
 public:
 

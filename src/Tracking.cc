@@ -18,19 +18,20 @@
 
 
 #include "Tracking.h"
-#include "SuperPointExtractor.h"
 
 #include<opencv2/core/core.hpp>
 #include<opencv2/features2d/features2d.hpp>
 #include<opencv2/core/eigen.hpp>
 
 #include"LKTracker.h"
-#include"ORBmatcher.h"
+#include"FeatureMatcher.h"
 #include"FrameDrawer.h"
 #include"Converter.h"
 #include"Initializer.h"
+#ifndef AQUA_HAS_GTSAM_DYNAMIC
 #include"G2oTypes.h"
 #include"Optimizer.h"
+#endif
 #include"PnPsolver.h"
 #include "Pinhole.h"
 // #include"Viewer.h"
@@ -41,8 +42,11 @@
 #include "System.h"
 #include "src/Integrator.h"
 #include <DVLGroPreIntegration.h>
+#include "MotionModelPose.h"
 
 #include<iostream>
+#include <filesystem>
+#include <stdexcept>
 #include <fstream>
 
 #include<mutex>
@@ -62,23 +66,23 @@ namespace ORB_SLAM3
 
 
 Tracking::Tracking(System *pSys,
-                   ORBVocabulary *pVoc,
-                   FrameDrawer *pFrameDrawer,
+	               FrameDrawer *pFrameDrawer,
                    Atlas *pAtlas,
                    KeyFrameDatabase *pKFDB,
                    RosHandling *pRosHandler,
                    DenseMapper *pDenseMapper,
                    const string &strSettingPath,
                    const int sensor,
-                   const string &_nameSeq)
+                   const string &_nameSeq,
+                   std::shared_ptr<const BackendFacade> backendFacade)
 	:
 	mState(NO_IMAGES_YET), mSensor(sensor), mTrackedFr(0), mbStep(false),
-	mbOnlyTracking(false), mbMapUpdated(false), mbVO(false), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB),
+	mbOnlyTracking(false), mbMapUpdated(false), mbVO(false), mpKeyFrameDB(pKFDB),
 	mpInitializer(static_cast<Initializer *>(NULL)), mpSystem(pSys),
 	mpFrameDrawer(pFrameDrawer),  mpAtlas(pAtlas), mnLastRelocFrameId(0),
-	time_recently_lost(5.0), mpDenseMapper(pDenseMapper),
+	time_recently_lost(5.0), mpMapToReset(nullptr), mpDenseMapper(pDenseMapper),
 	mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpRosHandler(pRosHandler),
-    mpDvlPreintegratedFromLastKF(nullptr)
+    mpDvlPreintegratedFromLastKF(nullptr), mpBackendFacade(std::move(backendFacade))
 {
 	// initialize the pose pulisher
 // // 	ros::NodeHandle n;  // original  // original
@@ -99,11 +103,8 @@ Tracking::Tracking(System *pSys,
 		std::cout << "*Error with the camera parameters in the config file*" << std::endl;
 	}
 
-	// Load ORB parameters
-	bool b_parse_orb = ParseORBParamFile(fSettings);
-	if (!b_parse_orb) {
-		std::cout << "*Error with the ORB parameters in the config file*" << std::endl;
-	}
+	if (!ParseFeatureFrontendParamFile(fSettings))
+		throw std::runtime_error("invalid FeatureFrontend configuration");
 
 	initID = 0;
 	lastID = 0;
@@ -111,13 +112,52 @@ Tracking::Tracking(System *pSys,
 	// Load IMU parameters
 	bool b_parse_imu = true;
 	if (sensor == System::IMU_MONOCULAR || sensor == System::IMU_STEREO || sensor == System::DVL_STEREO) {
-		b_parse_imu = ParseIMUParamFile(fSettings);
+	b_parse_imu = ParseIMUParamFile(fSettings);
 		if (!b_parse_imu) {
 			std::cout << "*Error with the IMU parameters in the config file*" << std::endl;
 		}
 
 		mnFramesToResetIMU = mMaxFrames;
 	}
+	if (!mpBackendFacade)
+		throw std::logic_error("Tracking requires the process backend facade");
+	mBackendMode = mpBackendFacade->mode();
+	if (sensor == System::DVL_STEREO &&
+	    mBackendMode == BackendMode::GtsamDynamic) {
+		const std::string trackMode = (std::string)fSettings["DvlTrackMode"];
+		if (trackMode == "bottom_track")
+			mDvlTrackMode = DvlTrackMode::BottomTrack;
+		else if (trackMode == "water_track")
+			mDvlTrackMode = DvlTrackMode::WaterTrack;
+		else
+			throw std::runtime_error("DvlTrackMode must be bottom_track or water_track");
+		const std::string messageContract =
+			(std::string)fSettings["DvlMessageContract"];
+		if (messageContract != "uw_slam_bridge/msg/DvlObservation")
+			throw std::runtime_error("DVL requires uw_slam_bridge/msg/DvlObservation");
+		std::filesystem::path uncertaintyProfile(
+			(std::string)fSettings["DvlUncertaintyProfile"]);
+		if (uncertaintyProfile.empty())
+			throw std::runtime_error("DvlUncertaintyProfile is missing");
+		if (uncertaintyProfile.is_relative())
+			uncertaintyProfile = std::filesystem::path(strSettingPath).parent_path() /
+				uncertaintyProfile;
+		uncertaintyProfile = uncertaintyProfile.lexically_normal();
+		if (!std::filesystem::is_regular_file(uncertaintyProfile))
+			throw std::runtime_error("DvlUncertaintyProfile does not exist: " +
+			                         uncertaintyProfile.string());
+		mDvlUncertaintyProfilePath = uncertaintyProfile.string();
+	}
+	// DVL is an optional measurement channel.  Its absence must not gate
+	// stereo-inertial startup; when present it is forwarded to the GTSAM
+	// transaction by the sensor-specific adapter path.
+#ifndef AQUA_HAS_GTSAM_DYNAMIC
+	if (mBackendMode == BackendMode::GtsamDynamic)
+		throw std::runtime_error("GTSAM_DYNAMIC requested but AQUA was built without UW_DYNAMIC_BACKEND_ROOT");
+#else
+	mCollectDynamicInitializationImu =
+		mBackendMode == BackendMode::GtsamDynamic;
+#endif
 	if (sensor == System::IMU_STEREO || sensor == System::DVL_STEREO) {
 		mKF_init_step = (double)fSettings["Optimizer.KF_init_step"];
 		mKF_num_for_init = fSettings["Optimizer.KF_num_for_init"];
@@ -145,7 +185,7 @@ Tracking::Tracking(System *pSys,
 
 	mnNumDataset = 0;
 
-	if (!b_parse_cam || !b_parse_orb || !b_parse_imu) {
+	if (!b_parse_cam || !b_parse_imu) {
 		std::cerr << "**ERROR in the config file, the format is not correct**" << std::endl;
 		try {
 			throw -1;
@@ -677,93 +717,69 @@ bool Tracking::ParseCamParamFile(cv::FileStorage &fSettings)
 	return true;
 }
 
-bool Tracking::ParseORBParamFile(cv::FileStorage &fSettings)
+bool Tracking::ParseFeatureFrontendParamFile(cv::FileStorage &fSettings)
 {
 	bool b_miss_params = false;
-	int nFeatures, nLevels, fIniThFAST, fMinThFAST;
-	float fScaleFactor;
+	NeuralFeatureFrontend::Config config;
+	auto readString = [&](const char* key, std::string& value) {
+		const cv::FileNode node = fSettings[key];
+		if (node.empty() || !node.isString()) {
+			std::cerr << "*" << key << " must be a string*" << std::endl;
+			b_miss_params = true;
+			return;
+		}
+		value = static_cast<std::string>(node);
+	};
+	auto readReal = [&](const char* key, float& value) {
+		const cv::FileNode node = fSettings[key];
+		if (node.empty() || (!node.isReal() && !node.isInt())) {
+			std::cerr << "*" << key << " must be numeric*" << std::endl;
+			b_miss_params = true;
+			return;
+		}
+		value = static_cast<float>(node.real());
+	};
 
-	cv::FileNode node = fSettings["ORBextractor.nFeatures"];
-	if (!node.empty() && node.isInt()) {
-		nFeatures = node.operator int();
+	std::string type;
+	std::string provider;
+	readString("FeatureFrontend.type", type);
+	readString("FeatureFrontend.provider", provider);
+	readString("FeatureFrontend.superpoint_onnx", config.superpoint_model);
+	readString("FeatureFrontend.superpoint_sha256", config.superpoint_sha256);
+	readString("FeatureFrontend.lightglue_onnx", config.lightglue_model);
+	readString("FeatureFrontend.lightglue_sha256", config.lightglue_sha256);
+	const cv::FileNode maxFeatures = fSettings["FeatureFrontend.max_features"];
+	if (maxFeatures.empty() || !maxFeatures.isInt()) {
+		std::cerr << "*FeatureFrontend.max_features must be an integer*" << std::endl;
+		b_miss_params = true;
+	} else {
+		config.max_features = static_cast<int>(maxFeatures);
 	}
-	else {
-		std::cerr << "*ORBextractor.nFeatures parameter doesn't exist or is not an integer*" << std::endl;
+	readReal("FeatureFrontend.match_threshold", config.match_threshold);
+	readReal("FeatureFrontend.keypoint_threshold", config.keypoint_threshold);
+	readReal("FeatureFrontend.projection_descriptor_threshold",
+	         config.projection_descriptor_threshold);
+	readReal("FeatureFrontend.stereo_max_vertical_error_px",
+	         mStereoMaxVerticalError);
+	if (type != "SUPERPOINT_LIGHTGLUE") {
+		std::cerr << "*FeatureFrontend.type must be SUPERPOINT_LIGHTGLUE*" << std::endl;
 		b_miss_params = true;
 	}
-
-	node = fSettings["ORBextractor.scaleFactor"];
-	if (!node.empty() && node.isReal()) {
-		fScaleFactor = node.real();
-	}
-	else {
-		std::cerr << "*ORBextractor.scaleFactor parameter doesn't exist or is not a real number*" << std::endl;
-		b_miss_params = true;
-	}
-
-	node = fSettings["ORBextractor.nLevels"];
-	if (!node.empty() && node.isInt()) {
-		nLevels = node.operator int();
-	}
-	else {
-		std::cerr << "*ORBextractor.nLevels parameter doesn't exist or is not an integer*" << std::endl;
-		b_miss_params = true;
-	}
-
-	node = fSettings["ORBextractor.iniThFAST"];
-	if (!node.empty() && node.isInt()) {
-		fIniThFAST = node.operator int();
-	}
-	else {
-		std::cerr << "*ORBextractor.iniThFAST parameter doesn't exist or is not an integer*" << std::endl;
-		b_miss_params = true;
-	}
-
-	node = fSettings["ORBextractor.minThFAST"];
-	if (!node.empty() && node.isInt()) {
-		fMinThFAST = node.operator int();
-	}
-	else {
-		std::cerr << "*ORBextractor.minThFAST parameter doesn't exist or is not an integer*" << std::endl;
+	if (provider != "CUDA") {
+		std::cerr << "*FeatureFrontend.provider must be CUDA*" << std::endl;
 		b_miss_params = true;
 	}
 
 	if (b_miss_params) {
 		return false;
 	}
-
-	mpORBextractorLeft = new ORBextractor(nFeatures, fScaleFactor, nLevels, fIniThFAST, fMinThFAST);
-	{
-		std::string spPath;
-		cv::FileNode spNode = fSettings["SuperPoint.onnx"];
-		if (!spNode.empty())
-			spPath = (std::string)spNode;
-		if (spPath.empty())
-			spPath = "/home/leong/leon_ws/AQUA-SLAM-ROS2/models/superpoint_v1.onnx";
-		const int spInputWidth = (int)fSettings["SuperPoint.input_width"].real();
-		const int spInputHeight = (int)fSettings["SuperPoint.input_height"].real();
-		const cv::Size spInputSize = spInputWidth > 0 && spInputHeight > 0
-			? cv::Size(spInputWidth, spInputHeight) : cv::Size();
-		static SuperPointExtractor sSuperPoint(spPath, nFeatures, 0.005f, 3, spInputSize);
-		Frame::SetSharedSuperPoint(&sSuperPoint);
-		if (sSuperPoint.Ready())
-			std::cout << "Front-end extractor: SuperPoint (ORB fallback disabled when SuperPoint ready)" << std::endl;
-	}
-
-	if (mSensor == System::STEREO || mSensor == System::IMU_STEREO || mSensor == System::DVL_STEREO) {
-		mpORBextractorRight = new ORBextractor(nFeatures, fScaleFactor, nLevels, fIniThFAST, fMinThFAST);
-	}
-
-	if (mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR) {
-		mpIniORBextractor = new ORBextractor(5 * nFeatures, fScaleFactor, nLevels, fIniThFAST, fMinThFAST);
-	}
-
-	cout << endl << "ORB Extractor Parameters: " << endl;
-	cout << "- Number of Features: " << nFeatures << endl;
-	cout << "- Scale Levels: " << nLevels << endl;
-	cout << "- Scale Factor: " << fScaleFactor << endl;
-	cout << "- Initial Fast Threshold: " << fIniThFAST << endl;
-	cout << "- Minimum Fast Threshold: " << fMinThFAST << endl;
+	mnFeatureTarget = config.max_features;
+	mpFeatureFrontend = std::make_unique<NeuralFeatureFrontend>(config);
+	cout << endl << "Feature Frontend: SUPERPOINT_LIGHTGLUE" << endl;
+	cout << "- Provider: " << mpFeatureFrontend->Provider() << endl;
+	cout << "- Maximum Features: " << mnFeatureTarget << endl;
+	cout << "- Match Threshold: " << config.match_threshold << endl;
+	cout << "- Stereo Vertical Error: " << mStereoMaxVerticalError << " px" << endl;
 
 	return true;
 }
@@ -904,6 +920,7 @@ bool Tracking::ParseIMUParamFile(cv::FileStorage &fSettings)
 	}
 
 	const float sf = sqrt(freq);
+	mImuFrequencyHz = freq;
 	cout << endl;
 	cout << "IMU frequency: " << freq << " Hz" << endl;
 	cout << "IMU gyro noise: " << Ng << " rad/s/sqrt(Hz)" << endl;
@@ -977,6 +994,9 @@ cv::Mat Tracking::GrabImageStereoDvl(const cv::Mat &imRectLeft,
                                      const std::vector<float>& vExtScore,
                                      const cv::Mat& extDepthScaled)
 {
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+    auto transaction = AcquireDynamicMapTransaction();
+#endif
 	mImLeft = imRectLeft.clone();
 	cv::Mat imGrayRight = imRectRight.clone();
 	mImRight = imRectRight.clone();
@@ -1009,19 +1029,17 @@ cv::Mat Tracking::GrabImageStereoDvl(const cv::Mat &imRectLeft,
 
 	if ((mSensor == System::DVL_STEREO || mSensor == System::IMU_STEREO) && !mpCamera2) {
 		// EKF DVL
-		//mCurrentFrame = Frame(mImGray, imGrayRight, timestamp, mpORBextractorLeft, mpORBextractorRight, mpORBVocabulary, mK, mDistCoef, mbf, mThDepth, mpCamera, mCurT_e0_ej, mCurTimeEKF, mGood_EKF, mT_e_c, mT_g_e, mCurT_g0_gj, mV_e);
 		// tighly coupled DVL
 		mCurrentFrame = Frame(mImLeft,
 		                      imGrayRight,
-		                      timestamp,
-		                      mpORBextractorLeft,
-		                      mpORBextractorRight,
-		                      mpORBVocabulary,
-		                      mK,
+			                      timestamp,
+			                      *mpFeatureFrontend,
+			                      mK,
 		                      mDistCoef,
 		                      mbf,
 		                      mThFarDepth,
 		                      mThCloseDepth,
+		                      mStereoMaxVerticalError,
 		                      mpCamera,
 		                      bDvl,
 		                      &mLastFrame,
@@ -1046,10 +1064,14 @@ mCurrentFrame.mNameFile = filename;
 
 	Track();
 
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+    if (mBackendMode == BackendMode::GtsamDynamic && mState == OK)
+        TryInitializeGtsamBackend();
+#endif
+
 	std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
 	double t_track = std::chrono::duration_cast<std::chrono::duration<double, std::milli> >(t1 - t0).count();
-
 	/*cout << "trracking time: " << t_track << endl;
 	f_track_stats << setprecision(0) << mCurrentFrame.mTimeStamp*1e9 << ",";
 	f_track_stats << mvpLocalKeyFrames.size() << ",";
@@ -1057,7 +1079,7 @@ mCurrentFrame.mNameFile = filename;
 	f_track_stats << setprecision(6) << t_track << endl;*/
 
 #ifdef SAVE_TIMES
-																															f_track_times << mCurrentFrame.mTimeORB_Ext << ",";
+																										f_track_times << mCurrentFrame.mTimeFeatureExtraction << ",";
     f_track_times << mCurrentFrame.mTimeStereoMatch << ",";
     f_track_times << mTime_PreIntIMU << ",";
     f_track_times << mTime_PosePred << ",";
@@ -1079,6 +1101,9 @@ cv::Mat Tracking::GrabImageStereoDvlgyro(const Mat &imRectLeft,
                                          const std::vector<float>& vExtScore,
                                          const cv::Mat& extDepthScaled)
 {
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+    auto transaction = AcquireDynamicMapTransaction();
+#endif
 	mImLeft = imRectLeft.clone();
 	cv::Mat imGrayRight = imRectRight.clone();
 	mImRight = imRectRight.clone();
@@ -1089,19 +1114,17 @@ cv::Mat Tracking::GrabImageStereoDvlgyro(const Mat &imRectLeft,
 
 	if ((mSensor == System::DVL_STEREO || mSensor == System::IMU_STEREO) && !mpCamera2) {
 		// EKF DVL
-		//mCurrentFrame = Frame(mImGray, imGrayRight, timestamp, mpORBextractorLeft, mpORBextractorRight, mpORBVocabulary, mK, mDistCoef, mbf, mThDepth, mpCamera, mCurT_e0_ej, mCurTimeEKF, mGood_EKF, mT_e_c, mT_g_e, mCurT_g0_gj, mV_e);
 		// tighly coupled DVL
 		mCurrentFrame = Frame(mImLeft,
 		                      imGrayRight,
-		                      timestamp,
-		                      mpORBextractorLeft,
-		                      mpORBextractorRight,
-		                      mpORBVocabulary,
-		                      mK,
+			                      timestamp,
+			                      *mpFeatureFrontend,
+			                      mK,
 		                      mDistCoef,
 		                      mbf,
 		                      mThFarDepth,
 		                      mThCloseDepth,
+		                      mStereoMaxVerticalError,
 		                      mpCamera,
 		                      bDvl,
 		                      &mLastFrame,
@@ -1128,6 +1151,11 @@ mCurrentFrame.mNameFile = filename;
 	else
 		TrackDVLGyro();
 
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+    if (mBackendMode == BackendMode::GtsamDynamic && mState == OK)
+        TryInitializeGtsamBackend();
+#endif
+
 	return mCurrentFrame.mTcw.clone();
 }
 
@@ -1135,11 +1163,652 @@ void Tracking::GrabImuData(const IMU::ImuPoint &imuMeasurement)
 {
 	unique_lock<mutex> lock(mMutexImuQueue);
 	mlQueueImuData.push_back(imuMeasurement);
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+	ImuSample dynamicSample;
+	dynamicSample.timestampSec = imuMeasurement.t;
+	dynamicSample.acceleration = {imuMeasurement.a.x, imuMeasurement.a.y,
+	                              imuMeasurement.a.z};
+	dynamicSample.angularVelocity = {imuMeasurement.w.x, imuMeasurement.w.y,
+	                                 imuMeasurement.w.z};
+	// Keyframe intervals must be formed from raw IMU arrival, not from the
+	// delayed enhanced-stereo frame window consumed by PreintegrateIMU().
+	mDynamicKeyframeImu.append({dynamicSample});
+	if (mCollectDynamicInitializationImu &&
+		(std::isfinite(dynamicSample.timestampSec)) &&
+		(mDynamicInitializationImu.empty() ||
+		 dynamicSample.timestampSec >
+		     mDynamicInitializationImu.back().timestampSec)) {
+		mDynamicInitializationImu.push_back(dynamicSample);
+	}
+#endif
+}
+
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+std::shared_ptr<GtsamBackendAdapter> Tracking::AcquireGtsamBackend() const
+{
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    return mpGtsamBackend;
+}
+
+bool Tracking::DynamicLastCommitSucceeded() const
+{
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    return mDynamicLastCommitSucceeded;
+}
+
+std::uint64_t Tracking::RecordCommittedKeyframeWatermark(
+    std::uint64_t keyframeId, double timestampSec, Map& map)
+{
+    if (!std::isfinite(timestampSec))
+        return 0U;
+    const std::uint64_t mapVersion =
+        static_cast<std::uint64_t>(map.GetMapChangeIndex());
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    mDynamicCommittedWatermark = {keyframeId, timestampSec, mapVersion};
+    mHasDynamicCommittedWatermark = true;
+    return ++mDynamicCommitSequence;
+}
+
+void Tracking::ResetDynamicBackendState()
+{
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    mpGtsamBackend.reset();
+    mDynamicLastCommitSucceeded = false;
+    mHasDynamicCommittedWatermark = false;
+    mLastDynamicInitializationTopology.reset();
+    mLatestDynamicDiagnostics.reset();
+    mDynamicRebaseRejectionCount = 0U;
+    mDynamicRebaseWarningLatched = false;
+}
+
+bool Tracking::PredictStateWithDynamicBackend()
+{
+    const auto backend = AcquireGtsamBackend();
+    if (!backend)
+        return false;
+
+    std::vector<ImuSample> imu;
+    {
+        std::lock_guard<std::mutex> lock(mMutexImuQueue);
+        imu = mDynamicKeyframeImu.pendingInterval(mCurrentFrame.mTimeStamp);
+    }
+    if (imu.empty()) {
+        RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                    "dynamic recovery lacks a bracketed IMU interval at %.9f",
+                    mCurrentFrame.mTimeStamp);
+        return false;
+    }
+
+    const auto prediction = backend->predictCameraPose(
+        mCurrentFrame.mTimeStamp, imu);
+    if (!prediction.accepted || prediction.cameraFromMap.empty() ||
+        !cv::checkRange(prediction.cameraFromMap)) {
+        RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                    "dynamic recovery prediction rejected at %.9f: %s",
+                    mCurrentFrame.mTimeStamp,
+                    prediction.diagnostic.empty()
+                        ? "invalid camera pose"
+                        : prediction.diagnostic.c_str());
+        return false;
+    }
+    mCurrentFrame.SetPose(prediction.cameraFromMap);
+    return true;
+}
+
+bool Tracking::TryInitializeGtsamBackend()
+{
+    if (AcquireGtsamBackend())
+        return true;
+    if (mCurrentFrame.mTimeStamp - mLastDynamicInitializationAttempt < 0.5)
+        return false;
+    mLastDynamicInitializationAttempt = mCurrentFrame.mTimeStamp;
+    std::vector<ImuSample> initializationImu;
+    {
+        std::unique_lock<std::mutex> lock(mMutexImuQueue);
+        if (mDynamicInitializationImu.size() < 2U ||
+            mDynamicInitializationImu.back().timestampSec <=
+                mDynamicInitializationImu.front().timestampSec)
+            return false;
+        initializationImu = mDynamicInitializationImu;
+    }
+    try {
+        if (!mpImuCalib)
+            throw std::runtime_error("IMU calibration is unavailable");
+        // The dynamic backend preintegrates raw IMU-frame measurements, so its
+        // body state is the IMU frame.  T_body_imu remains an output-only
+        // transform and must not enter the estimator state convention.
+        const cv::Mat bodyFromCamera = mpImuCalib->mT_imu_c;
+        auto transaction = AcquireDynamicMapTransaction();
+        Map* map = mpAtlas ? mpAtlas->GetCurrentMap() : nullptr;
+        if (!map)
+            return false;
+        const std::uint64_t version = map->GetMapChangeIndex();
+        // Tracking has released the map lock. All inserted bootstrap keyframes
+        // enter this graph once; the next keyframe starts a new IMU interval.
+        auto snapshot = GtsamMapAdapter::snapshot(*map, version);
+        if (snapshot.keyframes.empty())
+            return false;
+        const auto latest = std::max_element(snapshot.keyframes.begin(), snapshot.keyframes.end(),
+            [](const auto& left, const auto& right) {
+                return left.timestampSec < right.timestampSec;
+            });
+        if (initializationImu.back().timestampSec < latest->timestampSec ||
+            mLastDynamicInitializationTopology == snapshot.topologySignature)
+            return false;
+        if (!mpLocalMapper || mpLocalMapper->stopRequested())
+            return false;
+        mpLocalMapper->RequestStop();
+        struct ResumeMapping {
+            LocalMapping* mapper;
+            ~ResumeMapping() { mapper->Release(); }
+        } resumeMapping{mpLocalMapper};
+        // The mapper drains queued keyframes before reporting stopped. Its
+        // culling/fusion must finish before the initialization snapshot is taken.
+        while (!mpLocalMapper->isStopped()) {
+            if (mpLocalMapper->isFinished())
+                return false;
+            usleep(1000);
+        }
+        snapshot = GtsamMapAdapter::snapshot(*map, version);
+        mLastDynamicInitializationTopology = snapshot.topologySignature;
+        RCLCPP_INFO(
+            rclcpp::get_logger("aqua_slam"),
+            "dynamic GTSAM initialization inputs: keyframes=%zu stereo_observations=%zu imu_span_s=%.9f",
+            snapshot.keyframes.size(), snapshot.observations.size(),
+            initializationImu.back().timestampSec -
+                initializationImu.front().timestampSec);
+        BackendFrameInput noise;
+        if (!AquaBackendAdapter::applyDynamicImuCovariance(
+                noise, *mpImuCalib, mImuFrequencyHz))
+            throw std::runtime_error("invalid configured IMU noise");
+        const auto optionalSensors = GtsamOptionalSensorConfig::fromTrackingSensor(
+            mSensor == System::DVL_STEREO, mpImuCalib,
+            mDvlTrackMode, mDvlUncertaintyProfilePath);
+        noise.imu = initializationImu;
+        const auto solveStart = std::chrono::steady_clock::now();
+        auto initialization = GtsamBackendAdapter::prepareInitialization(
+            snapshot, noise, bodyFromCamera, optionalSensors);
+        RCLCPP_INFO(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM initialization solve_ms=%.3f accepted=%d",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - solveStart).count(),
+                    initialization.backend ? 1 : 0);
+        if (!initialization.backend || initialization.mapResult.keyframes.empty())
+            throw std::runtime_error(initialization.diagnostic);
+        const auto& last = initialization.mapResult.keyframes.back();
+        KeyFrame* reference = nullptr;
+        for (KeyFrame* keyframe : map->GetAllKeyFrames())
+            if (keyframe && keyframe->mnId == last.id)
+                reference = keyframe;
+        {
+            std::lock_guard<std::mutex> lock(mMutexImuQueue);
+            if (!mDynamicKeyframeImu.canAcceptKeyframe(last.timestampSec))
+                return false;
+        }
+        if (!reference || !CommitDynamicMapResult(
+                initialization.mapResult, *map, version, reference)) {
+            const auto current = GtsamMapAdapter::snapshot(*map, map->GetMapChangeIndex());
+            RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                        "dynamic GTSAM initialization map commit rejected reference=%d "
+                        "source_version=%lu current_version=%lu source_topology=%lu current_topology=%lu",
+                        reference ? 1 : 0, static_cast<unsigned long>(version),
+                        static_cast<unsigned long>(current.version),
+                        static_cast<unsigned long>(snapshot.topologySignature),
+                        static_cast<unsigned long>(current.topologySignature));
+            return false;
+        }
+        map->IncreaseChangeIndex();
+        {
+            std::lock_guard<std::mutex> lock(mMutexDynamicState);
+            mpGtsamBackend = initialization.backend;
+        }
+        RecordCommittedKeyframeWatermark(last.id, last.timestampSec, *map);
+        {
+            std::lock_guard<std::mutex> lock(mMutexImuQueue);
+            mDynamicKeyframeImu.acceptKeyframe(last.timestampSec);
+            mDynamicKeyframeDvl.commit(last.timestampSec);
+            mCollectDynamicInitializationImu = false;
+            mDynamicInitializationImu.clear();
+        }
+        RCLCPP_INFO(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM initialized from %.3f seconds of IMU; retained_keyframes=%zu initialization_dvl=unused",
+                    initializationImu.back().timestampSec -
+                        initializationImu.front().timestampSec,
+                    initialization.mapResult.keyframes.size());
+        return true;
+    } catch (const std::exception& exception) {
+        RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM waiting for physical initialization: %s",
+                    exception.what());
+        return false;
+    }
+}
+
+bool Tracking::ResetGtsamBackendAtKeyFrame(const cv::Mat& cameraFromMap,
+                                           double keyframeTimestamp)
+{
+    const auto backend = AcquireGtsamBackend();
+    if (!backend || !mpImuCalib ||
+        cameraFromMap.rows != 4 || cameraFromMap.cols != 4 ||
+        !cv::checkRange(cameraFromMap) || !std::isfinite(keyframeTimestamp))
+        return false;
+    try {
+        const cv::Mat bodyFromCamera = mpImuCalib->mT_imu_c;
+        const cv::Mat initialMapFromBody =
+            cameraFromMap.inv() * bodyFromCamera.inv();
+        if (!cv::checkRange(initialMapFromBody))
+            return false;
+        backend->reset(initialMapFromBody);
+
+        // Preserve already-acquired samples while moving the logical IMU
+        // boundary to the committed keyframe. No source timestamp changes.
+        {
+            std::unique_lock<std::mutex> lock(mMutexImuQueue);
+            const std::vector<ImuSample> buffered =
+                mDynamicKeyframeImu.samples();
+            mDynamicKeyframeImu.clear();
+            mDynamicKeyframeImu.append(buffered);
+            if (!mDynamicKeyframeImu.acceptKeyframe(keyframeTimestamp))
+                return false;
+        }
+        std::lock_guard<std::mutex> lock(mMutexDynamicState);
+        mDynamicLastCommitSucceeded = false;
+        return true;
+    } catch (const std::exception& exception) {
+        RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM map resynchronization failed: %s",
+                    exception.what());
+        return false;
+    }
+}
+
+bool Tracking::RebaseGtsamBackend(const BackendMapSnapshot& snapshot)
+{
+    const auto backend = AcquireGtsamBackend();
+    if (!backend)
+        return false;
+    const bool rebased = backend->rebase(snapshot);
+    RCLCPP_INFO(rclcpp::get_logger("aqua_slam"),
+                "dynamic GTSAM full-map rebase %s keyframes=%zu landmarks=%zu",
+                rebased ? "succeeded" : "failed", snapshot.keyframes.size(),
+                snapshot.landmarks.size());
+	return rebased;
+}
+
+std::unique_lock<std::recursive_timed_mutex> Tracking::AcquireDynamicMapTransaction()
+{
+    return std::unique_lock<std::recursive_timed_mutex>(mMutexDynamicMapTransaction);
+}
+
+std::unique_lock<std::recursive_timed_mutex> Tracking::TryAcquireDynamicMapTransaction()
+{
+    return std::unique_lock<std::recursive_timed_mutex>(
+        mMutexDynamicMapTransaction, std::try_to_lock);
+}
+
+bool Tracking::CaptureCommittedKeyframeWatermark(
+    CommittedKeyframeWatermark* watermark) const
+{
+    if (!watermark)
+        return false;
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    if (!mHasDynamicCommittedWatermark)
+        return false;
+    *watermark = mDynamicCommittedWatermark;
+    return true;
+}
+
+bool Tracking::AdvanceCommittedWatermarkMapVersion(
+    std::uint64_t expectedVersion, std::uint64_t newVersion)
+{
+    if (newVersion <= expectedVersion)
+        return false;
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    if (!mHasDynamicCommittedWatermark ||
+        mDynamicCommittedWatermark.mapVersion != expectedVersion)
+        return false;
+    mDynamicCommittedWatermark.mapVersion = newVersion;
+    return true;
+}
+
+void Tracking::RecordDynamicDiagnostics(
+    const BackendMapDiagnostics& diagnostics)
+{
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    mLatestDynamicDiagnostics = diagnostics;
+}
+
+std::optional<BackendMapDiagnostics> Tracking::LatestDynamicDiagnostics() const
+{
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    return mLatestDynamicDiagnostics;
+}
+
+void Tracking::RecordGtsamRebaseProjectionRejected(const std::string& reason)
+{
+    const auto now = std::chrono::steady_clock::now();
+    bool warn = false;
+    {
+        std::lock_guard<std::mutex> lock(mMutexDynamicState);
+        if (mDynamicRebaseRejectionCount++ == 0U)
+            mDynamicRebaseStaleSince = now;
+        if (!mDynamicRebaseWarningLatched &&
+            now - mDynamicRebaseStaleSince >= std::chrono::seconds(1)) {
+            mDynamicRebaseWarningLatched = true;
+            warn = true;
+        }
+    }
+    if (warn)
+        RCLCPP_ERROR(rclcpp::get_logger("aqua_slam"),
+                     "dynamic GTSAM rebase stale for at least 1 s: %s",
+                     reason.c_str());
+    else
+        RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM rebase projection rejected: %s",
+                    reason.c_str());
+}
+
+void Tracking::RecordGtsamRebaseSucceeded()
+{
+    std::lock_guard<std::mutex> lock(mMutexDynamicState);
+    mDynamicRebaseRejectionCount = 0U;
+    mDynamicRebaseWarningLatched = false;
+}
+
+void Tracking::SynchronizeAfterMapCorrection(
+    const cv::Mat& oldCameraFromMap, const cv::Mat& newCameraFromMap)
+{
+    auto transaction = AcquireDynamicMapTransaction();
+    if (oldCameraFromMap.rows != 4 || oldCameraFromMap.cols != 4 ||
+        newCameraFromMap.rows != 4 || newCameraFromMap.cols != 4 ||
+        !cv::checkRange(oldCameraFromMap) || !cv::checkRange(newCameraFromMap))
+        return;
+    // MapPoint write-back defines p_new = S * p_old.  Camera-from-map poses
+    // therefore transform as Tcw_new = Tcw_old * S^-1.
+    const cv::Mat mapCorrection =
+        oldCameraFromMap.inv() * newCameraFromMap;
+    if (!cv::checkRange(mapCorrection))
+        return;
+    if (!mLastFrame.mTcw.empty())
+        mLastFrame.SetPose(mLastFrame.mTcw * mapCorrection);
+    if (!mCurrentFrame.mTcw.empty())
+        mCurrentFrame.SetPose(mCurrentFrame.mTcw * mapCorrection);
+    if (!mLastFrame.mTcw.empty() && !mCurrentFrame.mTcw.empty())
+        mVelocity = mCurrentFrame.mTcw * mLastFrame.mTcw.inv();
+}
+
+bool Tracking::CommitDynamicMapResult(const BackendMapResult& result, Map& map,
+                                      std::uint64_t expectedVersion,
+                                      KeyFrame* correctionReference)
+{
+    auto transaction = AcquireDynamicMapTransaction();
+    if (mpAtlas && mpAtlas->GetCurrentMap() != &map)
+        return false;
+    if (!correctionReference)
+        return false;
+    const cv::Mat oldCameraFromMap = correctionReference->GetPose();
+    if (!GtsamMapAdapter::commit(result, map, expectedVersion))
+        return false;
+    SynchronizeAfterMapCorrection(
+        oldCameraFromMap, correctionReference->GetPose());
+    return true;
+}
+
+std::shared_ptr<GtsamPreparedMapOptimization> Tracking::PrepareDynamicMapOptimization(
+    const BackendMapSnapshot& snapshot,
+    const std::vector<BackendLandmarkReplacement>& replacements)
+{
+    const auto backend = AcquireGtsamBackend();
+    return backend ? backend->prepareMapOptimization(snapshot, replacements) : nullptr;
+}
+
+bool Tracking::CommitDynamicMapOptimization(
+    GtsamPreparedMapOptimization& candidate, Map& map,
+    std::uint64_t expectedVersion, KeyFrame* correctionReference)
+{
+    auto transaction = AcquireDynamicMapTransaction();
+    const auto backend = AcquireGtsamBackend();
+    CommittedKeyframeWatermark watermark;
+    if (!backend || !CaptureCommittedKeyframeWatermark(&watermark) ||
+        watermark.mapVersion != expectedVersion ||
+        !mpAtlas || mpAtlas->GetCurrentMap() != &map || !correctionReference ||
+        correctionReference->GetMap() != &map ||
+        std::none_of(candidate.result().keyframes.begin(),
+                     candidate.result().keyframes.end(),
+                     [&](const BackendKeyframeState& state) {
+                         return state.id == correctionReference->mnId;
+                     }))
+        return false;
+    if (!backend->commitMapOptimization(candidate, [&](const BackendMapResult& result) {
+            return CommitDynamicMapResult(result, map, expectedVersion,
+                                          correctionReference);
+        }))
+        return false;
+    map.IncreaseChangeIndex();
+    AdvanceCommittedWatermarkMapVersion(
+        expectedVersion, static_cast<std::uint64_t>(map.GetMapChangeIndex()));
+    return true;
+}
+#endif
+
+int Tracking::OptimizeCurrentFrameWithBackend(bool commitIncremental,
+                                              std::uint64_t committingKeyframeId)
+{
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+	if (commitIncremental) {
+		std::lock_guard<std::mutex> lock(mMutexDynamicState);
+		mDynamicLastCommitSucceeded = false;
+	}
+    RuntimeProfile profile;
+    if (mSensor == System::DVL_STEREO) {
+        profile.sensorMode = "stereo_inertial_dvl";
+        profile.dvlEnabled = true;
+    } else {
+        profile.sensorMode = "stereo_inertial";
+        profile.dvlEnabled = false;
+    }
+	    BackendFrameInput input = AquaBackendAdapter::fromFrame(mCurrentFrame, profile);
+		    if (profile.dvlEnabled && commitIncremental) {
+                std::lock_guard<std::mutex> lock(mMutexImuQueue);
+                input.dvl = mDynamicKeyframeDvl.pendingInterval(input.timestampSec);
+		    }
+	    const int persistentStereoSupport =
+        AquaBackendAdapter::persistentStereoSupport(input) +
+        static_cast<int>(input.monocularLandmarks.size());
+    if (!AcquireGtsamBackend()) {
+        if (!mpImuCalib)
+            return 0;
+        const auto bootstrap = GtsamBackendAdapter::refineVisualPose(
+            input, mK, mbf, mpImuCalib->mT_imu_c, mCurrentFrame.mTcw);
+        if (!bootstrap.accepted || persistentStereoSupport == 0)
+            return 0;
+        mCurrentFrame.SetPose((bootstrap.bodyPose * mpImuCalib->mT_imu_c).inv());
+        input.frontEndCameraFromMap = mCurrentFrame.mTcw.clone();
+        return persistentStereoSupport;
+    }
+    const auto backend = AcquireGtsamBackend();
+    if (!backend)
+        return 0;
+    input.imu.reserve(mvImuFromLastFrame.size());
+    for (const auto& sample : mvImuFromLastFrame) {
+        ImuSample converted;
+        converted.timestampSec = sample.t;
+        converted.acceleration = {sample.a.x, sample.a.y, sample.a.z};
+        converted.angularVelocity = {sample.w.x, sample.w.y, sample.w.z};
+        input.imu.push_back(converted);
+    }
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+    if (commitIncremental) {
+        bool missingPhysicalBrackets = false;
+        {
+            std::unique_lock<std::mutex> lock(mMutexImuQueue);
+            input.imu = mDynamicKeyframeImu.pendingInterval(input.timestampSec);
+            const bool rejectedInterval =
+                mDynamicKeyframeImu.hasAcceptedKeyframe() && input.imu.empty();
+            if (rejectedInterval) {
+                missingPhysicalBrackets = true;
+                const auto buffered = mDynamicKeyframeImu.samples();
+                double maximumGapSec = 0.0;
+                double gapLeftSec = std::numeric_limits<double>::quiet_NaN();
+                double gapRightSec = std::numeric_limits<double>::quiet_NaN();
+                for (std::size_t index = 1U; index < buffered.size(); ++index) {
+                    const double gap = buffered[index].timestampSec -
+                                       buffered[index - 1U].timestampSec;
+                    if (gap > maximumGapSec) {
+                        maximumGapSec = gap;
+                        gapLeftSec = buffered[index - 1U].timestampSec;
+                        gapRightSec = buffered[index].timestampSec;
+                    }
+                }
+                RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                            "dynamic IMU boundary evidence current=%.9f previous=%.9f "
+                            "buffer_size=%zu first=%.9f last=%.9f max_gap=%.9f "
+                            "gap_left=%.9f gap_right=%.9f",
+                            input.timestampSec,
+                            mDynamicKeyframeImu.lastAcceptedKeyframeTime(),
+                            mDynamicKeyframeImu.size(),
+                            mDynamicKeyframeImu.firstTimestamp(),
+                            mDynamicKeyframeImu.lastTimestamp(), maximumGapSec,
+                            gapLeftSec, gapRightSec);
+            }
+        }
+        if (missingPhysicalBrackets) {
+            RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                        "dynamic GTSAM deferring keyframe %.9f until its IMU interval has physical brackets",
+                        input.timestampSec);
+            return 0;
+        }
+    }
+#endif
+    // PreintegrateIMU intentionally retains the first sample after a camera
+    // boundary so the next frame can use it as its left endpoint.  Under a
+    // delayed enhanced-stereo worker that retained endpoint can also be
+    // copied into the current batch.  Remove only repeated/non-monotonic
+    // boundary samples before deriving dynamic covariance; source timestamps
+    // remain untouched and no synthetic IMU is introduced.
+    if (input.imu.size() > 1U) {
+        std::vector<ImuSample> monotonic;
+        monotonic.reserve(input.imu.size());
+        monotonic.push_back(input.imu.front());
+        for (std::size_t index = 1U; index < input.imu.size(); ++index) {
+            const auto& sample = input.imu[index];
+            if (std::isfinite(sample.timestampSec) &&
+                sample.timestampSec > monotonic.back().timestampSec)
+                monotonic.push_back(sample);
+        }
+        input.imu.swap(monotonic);
+    }
+    // Noise density belongs to the calibrated sensor, not the measured motion.
+    if (!mpImuCalib ||
+        !AquaBackendAdapter::applyDynamicImuCovariance(
+            input, *mpImuCalib, mImuFrequencyHz)) {
+        RCLCPP_ERROR(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM invalid calibrated IMU noise at %.9f",
+                    input.timestampSec);
+        return 0;
+    }
+    // Validate the logical keyframe watermark before entering GTSAM. This is
+    // a read-only check: the IMU interval remains available if optimization
+    // rejects the transaction.
+    if (commitIncremental) {
+        std::lock_guard<std::mutex> lock(mMutexImuQueue);
+        if (!mDynamicKeyframeImu.canAcceptKeyframe(input.timestampSec)) {
+            RCLCPP_ERROR(rclcpp::get_logger("aqua_slam"),
+                         "dynamic GTSAM refusing non-monotonic keyframe timestamp %.9f",
+                         input.timestampSec);
+            return 0;
+        }
+    }
+    const auto result = commitIncremental
+        ? backend->optimize(input)
+        : backend->refinePose(input, mCurrentFrame.mTcw);
+    if (commitIncremental) {
+        const std::string sensorDiagnostics =
+            AquaBackendAdapter::formatDynamicSensorDiagnostics(
+                input.timestampSec, result);
+        RCLCPP_INFO(rclcpp::get_logger("aqua_slam"), "%s",
+                    sensorDiagnostics.c_str());
+    }
+    if (commitIncremental && result.accepted && !result.incrementalCommitted) {
+        RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM did not commit keyframe %.9f; preserving IMU interval: %s",
+                    input.timestampSec,
+                    result.diagnostic.empty() ? "transaction degraded" : result.diagnostic.c_str());
+        return persistentStereoSupport;
+    }
+    bool acceptedKeyframeTimestamp = true;
+    std::uint64_t commitSequence = 0U;
+    if (commitIncremental && result.incrementalCommitted) {
+        std::lock_guard<std::mutex> lock(mMutexImuQueue);
+        acceptedKeyframeTimestamp =
+            mDynamicKeyframeImu.acceptKeyframe(input.timestampSec);
+        mDynamicKeyframeDvl.commit(input.timestampSec);
+        if (acceptedKeyframeTimestamp) {
+            Map* map = mpAtlas == nullptr ? nullptr : mpAtlas->GetCurrentMap();
+            if (map == nullptr)
+                acceptedKeyframeTimestamp = false;
+            else
+                commitSequence = RecordCommittedKeyframeWatermark(
+                    committingKeyframeId, input.timestampSec, *map);
+        }
+    }
+    if (commitIncremental && result.incrementalCommitted &&
+        !acceptedKeyframeTimestamp) {
+        RCLCPP_ERROR(rclcpp::get_logger("aqua_slam"),
+                     "dynamic GTSAM accepted a non-monotonic keyframe timestamp %.9f",
+                     input.timestampSec);
+        return 0;
+    }
+    const bool committedKeyframe =
+        commitIncremental && result.incrementalCommitted;
+    if (committedKeyframe) {
+        RCLCPP_INFO(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM committed keyframe t=%.9f backend_version=%lu commit_sequence=%lu imu_samples=%zu",
+                    input.timestampSec,
+                    static_cast<unsigned long>(result.mapVersion),
+                    static_cast<unsigned long>(commitSequence),
+                    input.imu.size());
+    }
+    // A duplicate-landmark transaction can be rejected before the first
+    // committed dynamic estimate exists (for example when initialization was
+    // refined but not committed). Keep the finite front-end pose for this
+    // frame so AQUA does not interpret a transactional backend diagnostic as
+    // camera loss and reset the active map.
+    if (AquaBackendAdapter::canPreserveFrontEndPose(result, mCurrentFrame)) {
+        RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM degraded frame %.9f; preserving finite front-end pose: %s",
+                    input.timestampSec, result.diagnostic.c_str());
+        return AquaBackendAdapter::trackingSupportAfterPoseCorrection(
+            committedKeyframe, false, result, persistentStereoSupport);
+    }
+    const cv::Mat cameraPose = backend->cameraPose(result);
+    if (!result.accepted || cameraPose.empty() || !cv::checkRange(cameraPose)) {
+        RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+                    "dynamic GTSAM rejected frame %.9f: %s",
+                    input.timestampSec,
+                    result.diagnostic.empty() ? "no diagnostic" : result.diagnostic.c_str());
+        return 0;
+    }
+    if (committedKeyframe) {
+        std::lock_guard<std::mutex> lock(mMutexDynamicState);
+        mDynamicLastCommitSucceeded = true;
+    }
+    mCurrentFrame.SetPose(cameraPose);
+    return AquaBackendAdapter::trackingSupportAfterPoseCorrection(
+        committedKeyframe, true, result, persistentStereoSupport);
+#else
+    return 0;
+#endif
 }
 void Tracking::GrabDVLGyroData(const GyroDvlPoint &DVLGyrosMeasurement)
 {
 	unique_lock<mutex> lock(mMutexImuQueue);
 	mlQueueDVLGyroData.push_back(DVLGyrosMeasurement);
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+    BackendFrameInput input;
+    if (AquaBackendAdapter::applyDvlMeasurement(input, DVLGyrosMeasurement))
+        mDynamicKeyframeDvl.append(input.dvl.front());
+#endif
 }
 
 void Tracking::PreintegrateIMU()
@@ -1737,6 +2406,10 @@ bool Tracking::PredictStateIMU()
 
 bool Tracking::PredictStateDvlGro()
 {
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+    if (mBackendMode == BackendMode::GtsamDynamic)
+        return PredictStateWithDynamicBackend();
+#endif
 	//	if (mState == NOT_INITIALIZED && mpAtlas->GetAllMaps().size() > 1) {
 	{
 		// std::lock_guard<std::mutex> lock_LossRfe(mLossIntegrationRefMutex);
@@ -2117,7 +2790,8 @@ void Tracking::Track()
 			CreateMapInAtlas();
 			return;
 		}
-		else if (mCurrentFrame.mTimeStamp > mLastFrame.mTimeStamp + 10.0) {
+		else if (mBackendMode != BackendMode::GtsamDynamic &&
+                 mCurrentFrame.mTimeStamp > mLastFrame.mTimeStamp + 10.0) {
 			cout << "id last: " << mLastFrame.mnId << "    id curr: " << mCurrentFrame.mnId << endl;
 			if (mpAtlas->isInertial()) {
 
@@ -2132,6 +2806,7 @@ void Tracking::Track()
 				}
 				else {
 					cout << "Timestamp jump detected, before IMU initialization. Reseting..." << endl;
+					mpMapToReset = pCurrentMap;
 					mpSystem->ResetActiveMap();
 				}
 			}
@@ -2182,7 +2857,7 @@ void Tracking::Track()
 	mbCreatedMap = false;
 
 	// Get Map Mutex -> Map cannot be changed
-	unique_lock<shared_timed_mutex> lock(pCurrentMap->mMutexMapUpdate);
+		unique_lock<shared_timed_mutex> lock(pCurrentMap->mMutexMapUpdate);
 
 	mbMapUpdated = false;
 
@@ -2304,19 +2979,19 @@ void Tracking::Track()
 					// then try to tracklocalmap()
 					// if slam can tracklocalmap() successfully in time_recently_lost, then continue
 					// if failed to tracklocalmap()  in time_recently_lost, then lost
-					if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO)) {
-						if (pCurrentMap->isImuInitialized()) {
-							PredictStateIMU();
-						}
-						else {
-							bOK = false;
-						}
+						if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO)) {
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+							if (mBackendMode == BackendMode::GtsamDynamic)
+								bOK = PredictStateWithDynamicBackend();
+							else
+#endif
+								bOK = pCurrentMap->isImuInitialized() && PredictStateIMU();
 
-						if (mCurrentFrame.mTimeStamp - mTimeStampLost > time_recently_lost) {
-							mState = LOST;
-							Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
-							bOK = false;
-						}
+							if (mCurrentFrame.mTimeStamp - mTimeStampLost > time_recently_lost) {
+								mState = LOST;
+								Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
+								bOK = false;
+							}
 					}
 					else if ((mSensor == System::DVL_STEREO && mCalibrated)) {
 						PredictStateDvlGro();
@@ -2473,7 +3148,8 @@ void Tracking::Track()
 		else if (mState == OK) {
 			if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO) {
 				Verbose::PrintMess("Track lost for less than one second...", Verbose::VERBOSITY_NORMAL);
-				if (!pCurrentMap->isImuInitialized() || !pCurrentMap->GetIniertialBA2()) {
+					if (mBackendMode != BackendMode::GtsamDynamic &&
+						(!pCurrentMap->isImuInitialized() || !pCurrentMap->GetIniertialBA2())) {
 					cout << "IMU is not or recently initialized. Reseting active map..." << endl;
 					mpSystem->ResetActiveMap();
 					mpMapToReset = mpAtlas->GetCurrentMap();
@@ -2581,6 +3257,24 @@ void Tracking::Track()
 				mLastFrame.GetCameraCenter().copyTo(LastTwc.rowRange(0, 3).col(3));
 				// T_cj_ci
 				mVelocity = mCurrentFrame.mTcw * LastTwc;
+				bool motionModelValid = true;
+				if (mBackendMode == BackendMode::GtsamDynamic) {
+					motionModelValid =
+						ProjectMotionModelPoseToSE3(mVelocity, mVelocity);
+				}
+				if (!motionModelValid) {
+					RCLCPP_ERROR(rclcpp::get_logger("aqua_slam"),
+					             "invalid dynamic motion-model update: frame=%lu "
+					             "timestamp=%.9f current_finite=%d last_finite=%d "
+					             "last_inverse_finite=%d current_type=%d last_type=%d",
+					             mCurrentFrame.mnId, mCurrentFrame.mTimeStamp,
+					             cv::checkRange(mCurrentFrame.mTcw),
+					             cv::checkRange(mLastFrame.mTcw),
+					             cv::checkRange(LastTwc), mCurrentFrame.mTcw.type(),
+					             mLastFrame.mTcw.type());
+					mVelocity.release();
+				}
+				if (motionModelValid) {
 				Eigen::Isometry3d T_ci_cj = Eigen::Isometry3d::Identity();
 				cv::cv2eigen(mVelocity, T_ci_cj.matrix());
 				T_ci_cj = T_ci_cj.inverse();
@@ -2604,6 +3298,7 @@ void Tracking::Track()
 				mCurrentFrame.SetVelocity(v_c0_cv);
 //				cout << "set velocity v_di: " << v_di.x() << " " << v_di.y() << " " << v_di.z() << endl;
 //				cout << "set velocity v_c0: " << v_c0.x() << " " << v_c0.y() << " " << v_c0.z() << endl;
+				}
 
 			}
 			else {
@@ -2716,6 +3411,19 @@ void Tracking::Track()
 	}
 }
 
+void Tracking::UpdateDynamicRecoveryState(bool visualTracked, bool predictionAccepted)
+{
+    if (visualTracked) {
+        mState = OK;
+        return;
+    }
+    if (mState == OK)
+        mTimeStampLost = mCurrentFrame.mTimeStamp;
+    mState = predictionAccepted &&
+        mCurrentFrame.mTimeStamp - mTimeStampLost <= time_recently_lost
+        ? RECENTLY_LOST : LOST;
+}
+
 void Tracking::TrackDVLGyro()
 {
 
@@ -2788,7 +3496,8 @@ void Tracking::TrackDVLGyro()
 		// after Initialization
 	else {
 		// System is initialized. Track Frame.
-		bool bOK;
+		bool bOK = false;
+        bool predictionAccepted = false;
 
 		// do DVL-IMU printegration
 
@@ -2798,7 +3507,7 @@ void Tracking::TrackDVLGyro()
 
 		// Initial camera pose estimation using motion model or relocalization (if tracking is lost)
 		// State OK
-		if (mState == OK) {
+		if (mState == OK || mState == RECENTLY_LOST) {
 
 			// Local Mapping might have changed some MapPoints tracked in last frame
 			CheckReplacedInLastFrame();
@@ -2822,14 +3531,9 @@ void Tracking::TrackDVLGyro()
 
 //                     ROS_INFO_STREAM("Fail to track with motion model!");  // original
 					// cout << "Fail to track with motion model!" << endl;
-                    if(!OK){
-                        PredictStateDvlGro();
-                    }
-                    if(pCurrentMap->KeyFramesInMap() >= mKFThresholdForMap){
-                        bOK = true;
-                    }
-                    else{
-                        mState = LOST;
+                    if (!bOK) {
+                        predictionAccepted = PredictStateDvlGro();
+                        bOK = predictionAccepted;
                     }
 
 
@@ -2881,21 +3585,11 @@ void Tracking::TrackDVLGyro()
             // }
             if (!bOK) {
 //                 ROS_INFO_STREAM("Fail to track local map!");  // original
-                PredictStateDvlGro();
+                predictionAccepted = PredictStateDvlGro();
             }
 		}
 
-		if (bOK) {
-			mState = OK;
-		}
-			// lost first
-		else if (mState == OK) {
-            mState = LOST;
-
-			if (mCurrentFrame.mnId > mnLastRelocFrameId + mMaxFrames) {
-				mTimeStampLost = mCurrentFrame.mTimeStamp;
-			}
-		}
+        UpdateDynamicRecoveryState(bOK, predictionAccepted);
 
 
 		// Update drawer
@@ -3528,16 +4222,73 @@ void Tracking::StereoInitialization()
 	}
 	RCLCPP_DEBUG(rclcpp::get_logger("aqua_slam"),
 	             "StereoInit attempt N=%d depthValid=%d", mCurrentFrame.N, nDepth);
-	if (mCurrentFrame.N > 40 && nDepth > 20) {
+	const bool dynamicStereoInitialization =
+		mBackendMode == BackendMode::GtsamDynamic &&
+		mSensor == System::IMU_STEREO;
+	int persistentDepthMatches = 0;
+	int persistentDepthAppearanceMatches = 0;
+	if (dynamicStereoInitialization && mHasDynamicStereoInitCandidate &&
+		mCurrentFrame.N > 0 && nDepth > 0) {
+		FeatureSet initialFeatures{mInitialFrame.mvKeysUn,
+		                           mInitialFrame.mDescriptors};
+		FeatureSet currentFeatures{mCurrentFrame.mvKeysUn,
+		                           mCurrentFrame.mDescriptors};
+		const auto matches = mpFeatureFrontend->Match(
+			initialFeatures, mInitialFrame.imgLeft.size(),
+			currentFeatures, mCurrentFrame.imgLeft.size());
+		mvIniMatches.assign(mInitialFrame.N, -1);
+		for (const auto& match : matches)
+			mvIniMatches[match.query_index] = match.train_index;
+		for (size_t i = 0; i < mvIniMatches.size() && i < mInitialFrame.mvDepth.size(); ++i) {
+			if (mvIniMatches[i] >= 0 && mInitialFrame.mvDepth[i] > 0) {
+				++persistentDepthMatches;
+				++persistentDepthAppearanceMatches;
+			}
+		}
+	}
+
+	if (!ShouldCommitStereoInitialization(dynamicStereoInitialization,
+	                                      mHasDynamicStereoInitCandidate,
+	                                      mCurrentFrame.N,
+	                                      nDepth,
+	                                      persistentDepthMatches,
+	                                      persistentDepthAppearanceMatches)) {
+		if (dynamicStereoInitialization && mCurrentFrame.N > 0 && nDepth > 0) {
+			mInitialFrame = Frame(mCurrentFrame);
+			mvbPrevMatched.resize(mCurrentFrame.mvKeysUn.size());
+			for (size_t i = 0; i < mCurrentFrame.mvKeysUn.size(); ++i)
+				mvbPrevMatched[i] = mCurrentFrame.mvKeysUn[i].pt;
+			mvIniMatches.assign(mCurrentFrame.mvKeysUn.size(), -1);
+			mHasDynamicStereoInitCandidate = true;
+			RCLCPP_INFO(rclcpp::get_logger("aqua_slam"),
+			            "StereoInit pending: frame=%lu features=%d depthValid=%d "
+				            "persistentDepthMatches=%d persistentDepthAppearanceMatches=%d",
+			            mCurrentFrame.mnId, mCurrentFrame.N, nDepth,
+				            persistentDepthMatches,
+				            persistentDepthAppearanceMatches);
+		}
+		else if (dynamicStereoInitialization) {
+			mHasDynamicStereoInitCandidate = false;
+			mvbPrevMatched.clear();
+			mvIniMatches.clear();
+		}
+		else if (mSensor == System::DVL_STEREO &&
+		         mpIntegrator->GetDoLossIntegration()) {
+			PredictStateDvlGro();
+		}
+		return;
+	}
+
+	mHasDynamicStereoInitCandidate = false;
+	mvbPrevMatched.clear();
+	mvIniMatches.clear();
+	{
 		if (mSensor == System::DVL_STEREO) {
             if (mpIntegrator->GetDoLossIntegration()) {
                 PredictStateDvlGro();
             }
             else {
                 mCurrentFrame.SetPose(cv::Mat::eye(4, 4, CV_32F));
-            }
-            if (!mCurrentFrame.mbDVL) {
-                return;
             }
             if(mInitialized)
             {
@@ -3655,7 +4406,10 @@ void Tracking::StereoInitialization()
         }
         auto all_loss_kf =getMvpLossKf();
         if(all_loss_kf.size()>0 && (mpIntegrator->GetDoLossIntegration())){
-            Optimizer::PoseOnlyOptimizationDVLIMU(all_loss_kf, mpAtlas, mLossLastOptID);
+            #ifndef AQUA_HAS_GTSAM_DYNAMIC
+            if (mBackendMode != BackendMode::GtsamDynamic)
+                Optimizer::PoseOnlyOptimizationDVLIMU(all_loss_kf, mpAtlas, mLossLastOptID);
+            #endif
             // ROS_DEBUG_STREAM("DVL IMU Optimization done");  // original
             RCLCPP_DEBUG(rclcpp::get_logger("aqua_slam"), "DVL IMU Optimization done");
             for (auto pKF : all_loss_kf) {
@@ -3669,12 +4423,7 @@ void Tracking::StereoInitialization()
         }
         // mpRosHandler->PublishLossKF(all_loss_kf);
 	}
-    else{
-        if (mpIntegrator->GetDoLossIntegration()) {
-            PredictStateDvlGro();
-        }
-    }
-}
+	}
 
 void Tracking::StereoInitializationKLT()
 {
@@ -3810,7 +4559,7 @@ void Tracking::MonocularInitialization()
 		}
 
 		// Find correspondences
-		ORBmatcher matcher(0.9, true);
+		FeatureMatcher matcher(*mpFeatureFrontend, 0.9F);
 		int nmatches = matcher.SearchForInitialization(mInitialFrame, mCurrentFrame, mvbPrevMatched, mvIniMatches, 100);
 
 		// Check if there are enough correspondences
@@ -3865,9 +4614,6 @@ void Tracking::CreateInitialMapMonocular()
 	}
 
 
-	pKFini->ComputeBoW();
-	pKFcur->ComputeBoW();
-
 	// Insert KFs in the map
 	mpAtlas->AddKeyFrame(pKFini);
 	mpAtlas->AddKeyFrame(pKFcur);
@@ -3905,10 +4651,6 @@ void Tracking::CreateInitialMapMonocular()
 
 	std::set<MapPoint *> sMPs;
 	sMPs = pKFini->GetMapPoints();
-
-	// Bundle Adjustment
-	//Verbose::PrintMess("New Map created with " + to_string(mpAtlas->MapPointsInMap()) + " points", Verbose::VERBOSITY_QUIET);
-	Optimizer::GlobalBundleAdjustemnt(mpAtlas->GetCurrentMap(), 20);
 
 	pKFcur->PrintPointDistribution();
 
@@ -3971,13 +4713,7 @@ void Tracking::CreateInitialMapMonocular()
 	// Compute here initial velocity
 	vector<KeyFrame *> vKFs = mpAtlas->GetAllKeyFrames();
 
-	cv::Mat deltaT = vKFs.back()->GetPose() * vKFs.front()->GetPoseInverse();
 	mVelocity = cv::Mat();
-	Eigen::Vector3d phi = LogSO3(Converter::toMatrix3d(deltaT.rowRange(0, 3).colRange(0, 3)));
-
-	double aux =
-		(mCurrentFrame.mTimeStamp - mLastFrame.mTimeStamp) / (mCurrentFrame.mTimeStamp - mInitialFrame.mTimeStamp);
-	phi *= aux;
 
 	mLastFrame = Frame(mCurrentFrame);
 
@@ -3996,6 +4732,17 @@ void Tracking::CreateMapInAtlas()
 {
 	cout << "create map" << endl;
 	mpLoopClosing->RequestResetActiveMap(mpAtlas->GetCurrentMap());
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+	if (mBackendMode == BackendMode::GtsamDynamic) {
+		ResetDynamicBackendState();
+		std::lock_guard<std::mutex> lock(mMutexImuQueue);
+		mDynamicKeyframeImu.clear();
+		mDynamicKeyframeDvl.clear();
+		mDynamicInitializationImu.clear();
+        mLastDynamicInitializationAttempt = -std::numeric_limits<double>::infinity();
+		mCollectDynamicInitializationImu = true;
+	}
+#endif
 	mnLastInitFrameId = mCurrentFrame.mnId;
 	mpAtlas->CreateNewMap();
 	if (mSensor == System::IMU_STEREO || mSensor == System::IMU_MONOCULAR) {
@@ -4005,6 +4752,7 @@ void Tracking::CreateMapInAtlas()
 
 	mnInitialFrameId = mCurrentFrame.mnId + 1;
 	mState = NO_IMAGES_YET;
+	mHasDynamicStereoInitCandidate = false;
 
 	// Restart the variable with information about the last KF
 	mVelocity = cv::Mat();
@@ -4070,6 +4818,7 @@ void Tracking::CreateMapInAtlas()
 //	mLastFrame.mTimeStamp = mCurrentFrame.mTimeStamp;
 	mCurrentFrame = Frame();
 	mvIniMatches.clear();
+	mvbPrevMatched.clear();
 
 	mbCreatedMap = true;
 
@@ -4091,18 +4840,14 @@ void Tracking::CheckReplacedInLastFrame()
 
 bool Tracking::TrackReferenceKeyFrame()
 {
-	// Compute Bag of Words vector
-	mCurrentFrame.ComputeBoW();
-
-	// We perform first an ORB matching with the reference keyframe
-	// If enough matches are found we setup a PnP solver
-	ORBmatcher matcher(0.7, true);
+	// Match the current frame to its reference keyframe before pose refinement.
+	FeatureMatcher matcher(*mpFeatureFrontend, 0.7F);
 	vector<MapPoint *> vpMapPointMatches;
 
-	// search matches via BoW
-	int nmatches = matcher.SearchByBoW(mpReferenceKF, mCurrentFrame, vpMapPointMatches);
+	int nmatches = matcher.SearchByNeuralPair(mpReferenceKF, mCurrentFrame,
+	                                           vpMapPointMatches);
 
-	if (nmatches < 15) {
+	if (mBackendMode == BackendMode::GtsamDynamic ? nmatches == 0 : nmatches < 15) {
 		RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
 		            "TrackReferenceKeyFrame rejected: frame=%lu dt=%.6f features=%d "
 		            "descriptors=%dx%d type=%d bow_matches=%d reference_kf=%lu",
@@ -4125,7 +4870,7 @@ bool Tracking::TrackReferenceKeyFrame()
 
 
 	// cout << " TrackReferenceKeyFrame mLastFrame.mTcw:  " << mLastFrame.mTcw << endl;
-	const int poseInliers = Optimizer::PoseOptimization(&mCurrentFrame);
+	const int poseInliers = OptimizeCurrentFrameWithBackend();
 
 	// Discard outliers
 	int nmatchesMap = 0;
@@ -4165,6 +4910,9 @@ bool Tracking::TrackReferenceKeyFrame()
 		            mpReferenceKF ? mpReferenceKF->mnId : 0);
 	}
 
+	if (mBackendMode == BackendMode::GtsamDynamic)
+		return poseInliers > 0;
+
 	// TODO check these conditions
 	if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO) {
 		return true;
@@ -4176,16 +4924,12 @@ bool Tracking::TrackReferenceKeyFrame()
 
 bool Tracking::TrackWithVisualAndEKF()
 {
-	// Compute Bag of Words vector
-	mCurrentFrame.ComputeBoW();
-
-	// We perform first an ORB matching with the reference keyframe
-	// If enough matches are found we setup a PnP solver
-	ORBmatcher matcher(0.7, true);
+	// Match the current frame to its reference keyframe before pose refinement.
+	FeatureMatcher matcher(*mpFeatureFrontend, 0.7F);
 	vector<MapPoint *> vpMapPointMatches;
 
-	// search matches via BoW
-	int nmatches = matcher.SearchByBoW(mpReferenceKF, mCurrentFrame, vpMapPointMatches);
+	int nmatches = matcher.SearchByNeuralPair(mpReferenceKF, mCurrentFrame,
+	                                           vpMapPointMatches);
 
 	if (nmatches < 15) {
 //        cout << "TRACK_REF_KF: Less than 15 matches!!\n";
@@ -4212,7 +4956,12 @@ bool Tracking::TrackWithVisualAndEKF()
 
 
 	// cout << " TrackReferenceKeyFrame mLastFrame.mTcw:  " << mLastFrame.mTcw << endl;
-	Optimizer::PoseOptimizationWithBA_and_EKF(&mCurrentFrame, &mLastFrame, mlamda_visual, mlamda_DVL);
+	if (mBackendMode == BackendMode::GtsamDynamic)
+		OptimizeCurrentFrameWithBackend();
+	#ifndef AQUA_HAS_GTSAM_DYNAMIC
+	else
+		Optimizer::PoseOptimizationWithBA_and_EKF(&mCurrentFrame, &mLastFrame, mlamda_visual, mlamda_DVL);
+	#endif
 
 	// Discard outliers
 	int nmatchesMap = 0;
@@ -4318,7 +5067,7 @@ void Tracking::UpdateLastFrame()
 
 void Tracking::saveMatchingResults(const cv::Mat &velocity_orb, const cv::Mat &velocity_dvl)
 {
-	ORBmatcher matcher(0.9, true);
+	FeatureMatcher matcher(*mpFeatureFrontend, 0.9F);
 
 	// Update last frame pose according to its reference keyframe
 	// Create "visual odometry" points if in Localization Mode
@@ -4438,7 +5187,9 @@ void Tracking::saveMatchingResults(const cv::Mat &velocity_orb, const cv::Mat &v
 	}
 
 	// Optimize frame pose with all matches
+	#ifndef AQUA_HAS_GTSAM_DYNAMIC
 	Optimizer::PoseOptimization(&curFrame_orb);
+	#endif
 
 	// Discard outliers
 	int nmatchesMap = 0;
@@ -4497,7 +5248,9 @@ void Tracking::saveMatchingResults(const cv::Mat &velocity_orb, const cv::Mat &v
 	}
 
 	// Optimize frame pose with all matches
+	#ifndef AQUA_HAS_GTSAM_DYNAMIC
 	Optimizer::PoseOptimizationWithBA_and_EKF(&curFrame_ekf, &lastFrame, mlamda_visual, mlamda_DVL);
+	#endif
 
 	// Discard outliers
 	nmatchesMap = 0;
@@ -4556,7 +5309,9 @@ void Tracking::saveMatchingResults(const cv::Mat &velocity_orb, const cv::Mat &v
 
 	// Optimize frame pose with all matches
 //	Optimizer::PoseOptimizationWithBA_and_EKF(&curFrame_gt,&lastFrame,mlamda_visual,mlamda_DVL);
+	#ifndef AQUA_HAS_GTSAM_DYNAMIC
 	Optimizer::PoseOptimization(&curFrame_gt);
+	#endif
 
 	// Discard outliers
 	nmatchesMap = 0;
@@ -4586,9 +5341,20 @@ void Tracking::saveMatchingResults(const cv::Mat &velocity_orb, const cv::Mat &v
 	file_gt.close();
 }
 
+int Tracking::MatchTemporalMapPoints()
+{
+	FeatureSet previous{mLastFrame.mvKeysUn, mLastFrame.mDescriptors};
+	FeatureSet current{mCurrentFrame.mvKeysUn, mCurrentFrame.mDescriptors};
+	const auto matches = mpFeatureFrontend->Match(
+		previous, mLastFrame.imgLeft.size(), current, mCurrentFrame.imgLeft.size());
+	const auto inliers = NeuralFeatureFrontend::FilterFundamentalInliers(
+		previous, current, matches, 3.0, 0.99);
+	return mCurrentFrame.TransferTemporalMapPoints(mLastFrame, inliers);
+}
+
 bool Tracking::TrackWithMotionModel()
 {
-	ORBmatcher matcher(0.9, true);
+	FeatureMatcher matcher(*mpFeatureFrontend, 0.9F);
 
 	// Update last frame pose according to its reference keyframe
 	// Create "visual odometry" points if in Localization Mode
@@ -4603,7 +5369,20 @@ bool Tracking::TrackWithMotionModel()
 		mVelocity.convertTo(mVelocity, CV_32FC1);
 		// mVelocity: T_cj_ci
 		// mLastFrame.mTcw: T_ci_c0
-		mCurrentFrame.SetPose(mVelocity * mLastFrame.mTcw);
+			cv::Mat predictedPose = mVelocity * mLastFrame.mTcw;
+			if (mBackendMode == BackendMode::GtsamDynamic &&
+				!ProjectMotionModelPoseToSE3(predictedPose, predictedPose)) {
+				RCLCPP_ERROR(rclcpp::get_logger("aqua_slam"),
+				             "invalid dynamic motion-model prediction: frame=%lu "
+				             "timestamp=%.9f velocity_finite=%d last_finite=%d "
+			             "velocity_type=%d last_type=%d",
+			             mCurrentFrame.mnId, mCurrentFrame.mTimeStamp,
+				             cv::checkRange(mVelocity), cv::checkRange(mLastFrame.mTcw),
+				             mVelocity.type(), mLastFrame.mTcw.type());
+				mVelocity.release();
+				return false;
+			}
+		mCurrentFrame.SetPose(predictedPose);
 	}
 	else {
 		// string v_type = getImageType(mVelocity.type());
@@ -4611,12 +5390,36 @@ bool Tracking::TrackWithMotionModel()
 		mVelocity.convertTo(mVelocity, CV_32FC1);
 		// mVelocity: T_cj_ci
 		// mLastFrame.mTcw: T_ci_c0
-		mCurrentFrame.SetPose(mVelocity * mLastFrame.mTcw);
+		cv::Mat predictedPose = mVelocity * mLastFrame.mTcw;
+		if (mBackendMode == BackendMode::GtsamDynamic &&
+			!ProjectMotionModelPoseToSE3(predictedPose, predictedPose)) {
+			RCLCPP_ERROR(rclcpp::get_logger("aqua_slam"),
+			             "invalid dynamic motion-model prediction: frame=%lu "
+			             "timestamp=%.9f velocity_finite=%d last_finite=%d "
+			             "velocity_type=%d last_type=%d",
+			             mCurrentFrame.mnId, mCurrentFrame.mTimeStamp,
+			             cv::checkRange(mVelocity), cv::checkRange(mLastFrame.mTcw),
+			             mVelocity.type(), mLastFrame.mTcw.type());
+			mVelocity.release();
+			return false;
+		}
+		if (mBackendMode != BackendMode::GtsamDynamic &&
+			!cv::checkRange(predictedPose)) {
+			RCLCPP_ERROR(rclcpp::get_logger("aqua_slam"),
+			             "motion-model prediction became non-finite: frame=%lu "
+			             "timestamp=%.9f velocity_finite=%d last_finite=%d "
+			             "velocity_type=%d last_type=%d",
+			             mCurrentFrame.mnId, mCurrentFrame.mTimeStamp,
+			             cv::checkRange(mVelocity), cv::checkRange(mLastFrame.mTcw),
+			             mVelocity.type(), mLastFrame.mTcw.type());
+		}
+		mCurrentFrame.SetPose(predictedPose);
 //		PredictStateDvlGro();
 	}
 
 
 	fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), static_cast<MapPoint *>(NULL));
+	int nmatches = MatchTemporalMapPoints();
 
 	// Project points seen in previous frame
 	int th;
@@ -4628,25 +5431,23 @@ bool Tracking::TrackWithMotionModel()
 		th = 15;
 	}
 
-	int nmatches = matcher.SearchByProjection(mCurrentFrame,
-	                                          mLastFrame,
-	                                          th,
-	                                          mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
+	nmatches += matcher.SearchByProjection(mCurrentFrame,
+	                                       mLastFrame,
+	                                       th,
+	                                       mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
 
 	// If few matches, uses a wider window search
 	if (nmatches < 20) {
 		Verbose::PrintMess("Not enough matches, wider window search!!", Verbose::VERBOSITY_NORMAL);
-		fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), static_cast<MapPoint *>(NULL));
-
-		nmatches = matcher.SearchByProjection(mCurrentFrame,
-		                                      mLastFrame,
-		                                      2 * th,
-		                                      mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
+		nmatches += matcher.SearchByProjection(mCurrentFrame,
+		                                       mLastFrame,
+		                                       2 * th,
+		                                       mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
 		Verbose::PrintMess("Matches with wider search: " + to_string(nmatches), Verbose::VERBOSITY_NORMAL);
 
 	}
 
-	if (nmatches < 20) {
+	if (mBackendMode != BackendMode::GtsamDynamic && nmatches < 20) {
 		Verbose::PrintMess("Not enough matches!!", Verbose::VERBOSITY_NORMAL);
 		if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO) {
 			return true;
@@ -4657,7 +5458,7 @@ bool Tracking::TrackWithMotionModel()
 	}
 
 	// Optimize frame pose with all matches
-	Optimizer::PoseOptimization(&mCurrentFrame);
+	const int poseSupport = OptimizeCurrentFrameWithBackend();
 
 	// Discard outliers
 	int nmatchesMap = 0;
@@ -4683,6 +5484,9 @@ bool Tracking::TrackWithMotionModel()
 		}
 	}
 
+	if (mBackendMode == BackendMode::GtsamDynamic)
+		return poseSupport > 0;
+
 	if (mbOnlyTracking) {
 		mbVO = nmatchesMap < 10;
 		return nmatches > 20;
@@ -4698,7 +5502,7 @@ bool Tracking::TrackWithMotionModel()
 
 bool Tracking::TrackWithMotionModelAndEKF()
 {
-	ORBmatcher matcher(0.9, true);
+	FeatureMatcher matcher(*mpFeatureFrontend, 0.9F);
 
 	// Update last frame pose according to its reference keyframe
 	// Create "visual odometry" points if in Localization Mode
@@ -4710,8 +5514,8 @@ bool Tracking::TrackWithMotionModelAndEKF()
 	if (mpAtlas->isImuInitialized() && (mCurrentFrame.mnId > mnLastRelocFrameId + mnFramesToResetIMU)) {
 		// Predict ste with IMU if it is initialized and it doesnt need reset
 		// calibrate pose of current frame by IMU, velocity could be calcuted further by pose
-		PredictStateIMU();
-		return true;
+		if (!PredictStateIMU())
+			return false;
 	}
 	else {
 		string v_type = getImageType(mVelocity.type());
@@ -4724,6 +5528,7 @@ bool Tracking::TrackWithMotionModelAndEKF()
 
 
 	fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), static_cast<MapPoint *>(NULL));
+	int nmatches = MatchTemporalMapPoints();
 
 	// Project points seen in previous frame
 	int th;
@@ -4735,20 +5540,18 @@ bool Tracking::TrackWithMotionModelAndEKF()
 		th = 15;
 	}
 
-	int nmatches = matcher.SearchByProjection(mCurrentFrame,
-	                                          mLastFrame,
-	                                          th,
-	                                          mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
+	nmatches += matcher.SearchByProjection(mCurrentFrame,
+	                                       mLastFrame,
+	                                       th,
+	                                       mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
 
 	// If few matches, uses a wider window search
 	if (nmatches < 10) {
 		Verbose::PrintMess("Not enough matches, wider window search!!", Verbose::VERBOSITY_NORMAL);
-		fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), static_cast<MapPoint *>(NULL));
-
-		nmatches = matcher.SearchByProjection(mCurrentFrame,
-		                                      mLastFrame,
-		                                      2 * th,
-		                                      mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
+		nmatches += matcher.SearchByProjection(mCurrentFrame,
+		                                       mLastFrame,
+		                                       2 * th,
+		                                       mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
 		Verbose::PrintMess("Matches with wider search: " + to_string(nmatches), Verbose::VERBOSITY_NORMAL);
 
 	}
@@ -4764,7 +5567,12 @@ bool Tracking::TrackWithMotionModelAndEKF()
 	}
 
 	// Optimize frame pose with all matches
-	Optimizer::PoseOptimizationWithBA_and_EKF(&mCurrentFrame, &mLastFrame, mlamda_visual, mlamda_DVL);
+	if (mBackendMode == BackendMode::GtsamDynamic)
+		OptimizeCurrentFrameWithBackend();
+	#ifndef AQUA_HAS_GTSAM_DYNAMIC
+	else
+		Optimizer::PoseOptimizationWithBA_and_EKF(&mCurrentFrame, &mLastFrame, mlamda_visual, mlamda_DVL);
+	#endif
 
 	// Discard outliers
 	int nmatchesMap = 0;
@@ -4805,7 +5613,7 @@ bool Tracking::TrackWithMotionModelAndEKF()
 
 void Tracking::SaveOptimizationResult()
 {
-	ORBmatcher matcher(0.9, true);
+	FeatureMatcher matcher(*mpFeatureFrontend, 0.9F);
 
 	// Update last frame pose according to its reference keyframe
 	// Create "visual odometry" points if in Localization Mode
@@ -4853,6 +5661,7 @@ void Tracking::SaveOptimizationResult()
 	Frame f_ekf(mCurrentFrame);
 	Frame f_orb_ekf(mCurrentFrame);
 	// Optimize frame pose with all matches
+	#ifndef AQUA_HAS_GTSAM_DYNAMIC
 	Optimizer::PoseOptimization(&f_orb);
 	if (mDVL_func_debug == 1) {
 		Optimizer::PoseOptimizationWithBA_and_EKF(&f_orb_ekf, &mLastFrame, mlamda_visual, mlamda_DVL_debug);
@@ -4861,6 +5670,7 @@ void Tracking::SaveOptimizationResult()
 		Optimizer::PoseOptimizationWithBA_and_EKF2(&f_orb_ekf, &mLastFrame, mlamda_visual, mlamda_DVL_debug);
 	}
 	Optimizer::PoseOptimizationWithEKF(&f_ekf, &mLastFrame);
+	#endif
 //	T_e0_ej_gt = T_e_c * T_c0_ci * T_c_e * T_ei_ej_gt
 	Eigen::Isometry3d T_gt = Eigen::Isometry3d::Identity();
 	Eigen::Isometry3d T_ei_ej_gt = Eigen::Isometry3d::Identity();
@@ -4932,9 +5742,11 @@ void Tracking::drawOptimizationResult()
 	Frame f_dvl_gyro(mCurrentFrame);
 	Frame f_orb(mCurrentFrame);
 
+	#ifndef AQUA_HAS_GTSAM_DYNAMIC
 	Optimizer::PoseOptimization(&f_orb);
 
 	Optimizer::PoseDvlGyrosOPtimizationLastFrame(&f_dvl_gyro, mlamda_DVL);
+	#endif
 
 	cv::Mat img_dvl_gyro(mCurrentFrame.imgLeft.rows, mCurrentFrame.imgLeft.cols, CV_8UC1);
 	cv::Mat img_orb(mCurrentFrame.imgLeft.rows, mCurrentFrame.imgLeft.cols, CV_8UC1);
@@ -5100,7 +5912,9 @@ bool Tracking::TrackLocalMap()
 			}
 		}
 
-	const int poseInliers = Optimizer::PoseOptimization(&mCurrentFrame);
+	// Refine every camera frame; dynamic graph state is committed only for a
+	// newly created AQUA keyframe.
+	const int poseInliers = OptimizeCurrentFrameWithBackend(false);
 //	if (!mpAtlas->isImuInitialized()) {
 //		Optimizer::PoseOptimization(&mCurrentFrame);
 //	}
@@ -5159,7 +5973,7 @@ bool Tracking::TrackLocalMap()
 	// Decide if the tracking was succesful
 	// More restrictive if there was a relocalization recently
 	mpLocalMapper->mnMatchesInliers = mnMatchesInliers;
-    if(mnMatchesInliers < mpORBextractorLeft->nfeatures * 0.10){
+	if(mnMatchesInliers < mnFeatureTarget * 0.10){
         mCurrentFrame.mPoorVision = true;
     }
 //     // ROS_INFO_STREAM("Matching Inliers: "<<mnMatchesInliers);  // original
@@ -5174,11 +5988,17 @@ bool Tracking::TrackLocalMap()
     // if(mnMatchesInliers<20){
     //     PredictStateDvlGro();
     // }
-	if (mnMatchesInliers < 10) {
+	    // Only persistent MapPoints constrain motion across frames. Per-frame
+	    // stereo depth without a MapPoint is useful for initialization, but must
+	    // not keep tracking alive after persistent map support is lost.
+    const int trackingSupport =
+        mBackendMode == BackendMode::GtsamDynamic ? poseInliers : mnMatchesInliers;
+    if (mBackendMode == BackendMode::GtsamDynamic ? trackingSupport == 0
+                                               : trackingSupport < 10) {
 		RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
 		            "TrackLocalMap rejected: frame=%lu dt=%.6f features=%d "
 		            "associations_before=%d associations_after=%d pose_inliers=%d "
-		            "map_inliers=%d local_keyframes=%zu local_points=%zu",
+			    "map_inliers=%d local_keyframes=%zu local_points=%zu",
 		            mCurrentFrame.mnId,
 		            mCurrentFrame.mTimeStamp - mLastFrame.mTimeStamp,
 		            mCurrentFrame.N,
@@ -5186,8 +6006,8 @@ bool Tracking::TrackLocalMap()
 		            aux1,
 		            poseInliers,
 		            mnMatchesInliers,
-		            mvpLocalKeyFrames.size(),
-		            mvpLocalMapPoints.size());
+			    mvpLocalKeyFrames.size(),
+			    mvpLocalMapPoints.size());
 		return false;
     }
     else {
@@ -5221,7 +6041,11 @@ bool Tracking::TrackLocalMapWithDvlGyro()
 //	Optimizer::PoseOptimization(&mCurrentFrame);
 //
 
-	if (!mbMapUpdated) //  && (mnMatchesInliers>30))
+	if (mBackendMode == BackendMode::GtsamDynamic) {
+		inliers = OptimizeCurrentFrameWithBackend();
+	}
+	#ifndef AQUA_HAS_GTSAM_DYNAMIC
+	else if (!mbMapUpdated) //  && (mnMatchesInliers>30))
 	{
 //		cout << "track local map from last Frame" << endl;
 		inliers =
@@ -5232,6 +6056,7 @@ bool Tracking::TrackLocalMapWithDvlGyro()
 		inliers =
 			Optimizer::PoseDvlGyrosOPtimizationLastKeyFrame(&mCurrentFrame, mlamda_DVL);
 	}
+	#endif
 
 	aux1 = 0, aux2 = 0;
 	for (int i = 0; i < mCurrentFrame.N; i++)
@@ -5267,7 +6092,7 @@ bool Tracking::TrackLocalMapWithDvlGyro()
 	// Decide if the tracking was succesful
 	// More restrictive if there was a relocalization recently
 	mpLocalMapper->mnMatchesInliers = mnMatchesInliers;
-    if(mnMatchesInliers < mpORBextractorLeft->nfeatures * 0.15){
+	if(mnMatchesInliers < mnFeatureTarget * 0.15){
         mCurrentFrame.mPoorVision = true;
     }
 //	if ( (mCurrentFrame.mnId < mnLastRelocFrameId + mMaxFrames) && (mnMatchesInliers < 50)) {
@@ -5296,6 +6121,9 @@ bool Tracking::TrackLocalMapWithDvlGyro()
 //		}
 //	}
 
+	if (mBackendMode == BackendMode::GtsamDynamic)
+		return inliers > 0;
+
 	if (mSensor == System::DVL_STEREO) {
 //		cout << "inliers: " << mnMatchesInliers << endl;
 		if (mnMatchesInliers < 30) {
@@ -5317,7 +6145,9 @@ bool Tracking::TrackLocalMapWithDvlGyro()
 
 bool Tracking::NeedNewKeyFrame()
 {
-	const bool sensorReady = mSensor != System::DVL_STEREO || mCurrentFrame.mbDVL;
+	// DVL is an optional asynchronous observation; visual-inertial tracking
+	// remains eligible when the current image has no fresh DVL sample.
+	const bool sensorReady = true;
 
 	if (!mCalibrated) {
 		if (mCurrentFrame.mTimeStamp - mpLastKeyFrame->mTimeStamp >= mKF_init_step
@@ -5441,7 +6271,25 @@ void Tracking::CreateNewKeyFrame()
 //		}
 //	}
 //	cout<<"before insert new keyframe, assigned feature in frame: "<<assigned_feature<<endl;
-	KeyFrame *pKF = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
+KeyFrame *pKF = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+	if (mBackendMode == BackendMode::GtsamDynamic) {
+		// Before inertial initialization, visual keyframes maintain map support.
+        // Once fusion starts, only a committed transaction may publish a keyframe.
+		const int trackingSupport = OptimizeCurrentFrameWithBackend(true, pKF->mnId);
+        const bool visualBootstrap = !AcquireGtsamBackend() && trackingSupport > 0;
+		if (!DynamicLastCommitSucceeded() && !visualBootstrap) {
+			RCLCPP_WARN(rclcpp::get_logger("aqua_slam"),
+			            "dynamic GTSAM keyframe transaction was not committed; "
+			            "discarding uncommitted front-end keyframe and preserving IMU interval");
+			delete pKF;
+			mpLocalMapper->SetNotStop(false);
+			return;
+		} else {
+			pKF->SetPose(mCurrentFrame.mTcw);
+		}
+	}
+#endif
 	mpDenseMapper->InsertNewKF(pKF);
 //	assigned_feature=0;
 //	for (int i = 0; i < FRAME_GRID_COLS; i++)
@@ -5850,7 +6698,7 @@ void Tracking::SearchLocalPoints()
 	}
 
 	if (nToMatch > 0) {
-		ORBmatcher matcher(0.8);
+		FeatureMatcher matcher(*mpFeatureFrontend, 0.8F);
 		int th = 1;
 		if (mSensor == System::RGBD) {
 			th = 3;
@@ -6068,9 +6916,6 @@ void Tracking::UpdateLocalKeyFrames()
 bool Tracking::Relocalization()
 {
 	Verbose::PrintMess("Starting relocalization", Verbose::VERBOSITY_NORMAL);
-	// Compute Bag of Words Vector
-	mCurrentFrame.ComputeBoW();
-
 	// Relocalization is performed when tracking is lost
 	// Track Lost: Query KeyFrame Database for keyframe candidates for relocalisation
 	vector<KeyFrame *>
@@ -6085,7 +6930,7 @@ bool Tracking::Relocalization()
 
 	// We perform first an ORB matching with each candidate
 	// If enough matches are found we setup a PnP solver
-	ORBmatcher matcher(0.75, true);
+	FeatureMatcher matcher(*mpFeatureFrontend, 0.75F);
 
 	vector<MLPnPsolver *> vpMLPnPsolvers;
 	vpMLPnPsolvers.resize(nKFs);
@@ -6104,7 +6949,8 @@ bool Tracking::Relocalization()
 			vbDiscarded[i] = true;
 		}
 		else {
-			int nmatches = matcher.SearchByBoW(pKF, mCurrentFrame, vvpMapPointMatches[i]);
+			int nmatches = matcher.SearchByNeuralPair(
+				pKF, mCurrentFrame, vvpMapPointMatches[i]);
 			if (nmatches < 15) {
 				vbDiscarded[i] = true;
 				continue;
@@ -6120,7 +6966,7 @@ bool Tracking::Relocalization()
 	// Alternatively perform some iterations of P4P RANSAC
 	// Until we found a camera pose supported by enough inliers
 	bool bMatch = false;
-	ORBmatcher matcher2(0.9, true);
+	FeatureMatcher matcher2(*mpFeatureFrontend, 0.9F);
 
 	while (nCandidates > 0 && !bMatch) {
 		for (int i = 0; i < nKFs; i++) {
@@ -6160,7 +7006,7 @@ bool Tracking::Relocalization()
 					}
 				}
 
-				int nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+				int nGood = OptimizeCurrentFrameWithBackend();
 
 				if (nGood < 10) {
 					continue;
@@ -6173,10 +7019,10 @@ bool Tracking::Relocalization()
 
 				// If few inliers, search by projection in a coarse window and optimize again
 				if (nGood < 50) {
-					int nadditional = matcher2.SearchByProjection(mCurrentFrame, vpCandidateKFs[i], sFound, 10, 100);
+					int nadditional = matcher2.SearchByProjection(mCurrentFrame, vpCandidateKFs[i], sFound, 10);
 
 					if (nadditional + nGood >= 50) {
-						nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+						nGood = OptimizeCurrentFrameWithBackend();
 
 						// If many inliers but still not enough, search by projection again in a narrower window
 						// the camera has been already optimized with many points
@@ -6186,11 +7032,11 @@ bool Tracking::Relocalization()
 								if (mCurrentFrame.mvpMapPoints[ip]) {
 									sFound.insert(mCurrentFrame.mvpMapPoints[ip]);
 								}
-							nadditional = matcher2.SearchByProjection(mCurrentFrame, vpCandidateKFs[i], sFound, 3, 64);
+							nadditional = matcher2.SearchByProjection(mCurrentFrame, vpCandidateKFs[i], sFound, 3);
 
 							// Final optimization
 							if (nGood + nadditional >= 50) {
-								nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+								nGood = OptimizeCurrentFrameWithBackend();
 
 								for (int io = 0; io < mCurrentFrame.N; io++)
 									if (mCurrentFrame.mvbOutlier[io]) {
@@ -6225,8 +7071,17 @@ bool Tracking::Relocalization()
 void Tracking::Reset(bool bLocMap)
 {
 	Verbose::PrintMess("System Reseting", Verbose::VERBOSITY_NORMAL);
-
-
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+		if (mBackendMode == BackendMode::GtsamDynamic) {
+			ResetDynamicBackendState();
+			std::lock_guard<std::mutex> lock(mMutexImuQueue);
+			mDynamicKeyframeImu.clear();
+			mDynamicKeyframeDvl.clear();
+			mDynamicInitializationImu.clear();
+            mLastDynamicInitializationAttempt = -std::numeric_limits<double>::infinity();
+			mCollectDynamicInitializationImu = true;
+	}
+#endif
 
 	// Reset Local Mapping
 	if (!bLocMap) {
@@ -6257,6 +7112,7 @@ void Tracking::Reset(bool bLocMap)
 	KeyFrame::nNextId = 0;
 	Frame::nNextId = 0;
 	mState = NO_IMAGES_YET;
+	mHasDynamicStereoInitCandidate = false;
 
 	if (mpInitializer) {
 		delete mpInitializer;
@@ -6272,8 +7128,9 @@ void Tracking::Reset(bool bLocMap)
 	mnLastRelocFrameId = 0;
 	mLastFrame = Frame();
 	mpReferenceKF = static_cast<KeyFrame *>(NULL);
-	// mpLastKeyFrame = static_cast<KeyFrame *>(NULL);
+	mpLastKeyFrame = static_cast<KeyFrame *>(NULL);
 	mvIniMatches.clear();
+	mvbPrevMatched.clear();
 
 
 	Verbose::PrintMess("   End reseting! ", Verbose::VERBOSITY_NORMAL);
@@ -6283,9 +7140,20 @@ void Tracking::Reset(bool bLocMap)
 void Tracking::ResetActiveMap(bool bLocMap)
 {
 	Verbose::PrintMess("Active map Reseting", Verbose::VERBOSITY_NORMAL);
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+		if (mBackendMode == BackendMode::GtsamDynamic) {
+			ResetDynamicBackendState();
+			std::lock_guard<std::mutex> lock(mMutexImuQueue);
+			mDynamicKeyframeImu.clear();
+			mDynamicKeyframeDvl.clear();
+			mDynamicInitializationImu.clear();
+            mLastDynamicInitializationAttempt = -std::numeric_limits<double>::infinity();
+			mCollectDynamicInitializationImu = true;
+	}
+#endif
 
 	Map *pCurMap = mpAtlas->GetCurrentMap();
-	Map *pMapToReset = mpMapToReset;
+	Map *pMapToReset = mpMapToReset ? mpMapToReset : pCurMap;
 	std::unique_lock<std::shared_timed_mutex> lock(pMapToReset->mMutexMapUpdate, std::defer_lock);
 	std::unique_lock<std::shared_timed_mutex> lock2(pCurMap->mMutexMapUpdate, std::defer_lock);
     lock.lock();
@@ -6340,6 +7208,7 @@ void Tracking::ResetActiveMap(bool bLocMap)
 	mnLastInitFrameId = Frame::nNextId;
 	mnLastRelocFrameId = mnLastInitFrameId;
 	mState = NO_IMAGES_YET; //NOT_INITIALIZED;
+	mHasDynamicStereoInitCandidate = false;
 
 	if (mpInitializer) {
 		delete mpInitializer;
@@ -6387,6 +7256,7 @@ void Tracking::ResetActiveMap(bool bLocMap)
 	mpReferenceKF = static_cast<KeyFrame *>(NULL);
 	// mpLastKeyFrame = static_cast<KeyFrame *>(NULL);
 	mvIniMatches.clear();
+	mvbPrevMatched.clear();
 
 
 
@@ -6637,7 +7507,7 @@ void Tracking::CreateNewMapPoints()
 	// Retrieve neighbor keyframes in covisibility graph
 	const vector<KeyFrame *> vpKFs = mpAtlas->GetAllKeyFrames();
 
-	ORBmatcher matcher(0.6, false);
+	FeatureMatcher matcher(*mpFeatureFrontend, 0.6F);
 
 	cv::Mat Rcw1 = mpLastKeyFrame->GetRotation();
 	cv::Mat Rwc1 = Rcw1.t();
@@ -6689,7 +7559,8 @@ void Tracking::CreateNewMapPoints()
 
 		// Search matches that fullfil epipolar constraint
 		vector<pair<size_t, size_t> > vMatchedIndices;
-		matcher.SearchForTriangulation(mpLastKeyFrame, pKF2, F12, vMatchedIndices, false);
+		matcher.SearchForNeuralTriangulation(
+			mpLastKeyFrame, pKF2, F12, vMatchedIndices, false);
 
 		cv::Mat Rcw2 = pKF2->GetRotation();
 		cv::Mat Rwc2 = Rcw2.t();
@@ -6940,15 +7811,14 @@ cv::Mat Tracking::GrabImageStereoDvlKLT(const Mat &imRectLeft,
 
 	mCurrentFrame = Frame(mImLeft,
 	                      imGrayRight,
-	                      timestamp,
-	                      mpORBextractorLeft,
-	                      mpORBextractorRight,
-	                      mpORBVocabulary,
-	                      mK,
+		                      timestamp,
+		                      *mpFeatureFrontend,
+		                      mK,
 	                      mDistCoef,
 	                      mbf,
 	                      mThFarDepth,
 	                      mThCloseDepth,
+	                      mStereoMaxVerticalError,
 	                      mpCamera,
 	                      bDvl,
 	                      &mLastFrame,

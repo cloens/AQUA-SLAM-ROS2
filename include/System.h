@@ -59,9 +59,9 @@
 // #include "MapDrawer.h"
 #include "DenseMapper.h"
 
-#include "KeyFrameDatabase.h"
-#include "ORBVocabulary.h"
+#include "KeyFrameRegistry.h"
 #include "ImuTypes.h"
+#include "BackendFacade.h"
 
 
 namespace ORB_SLAM3
@@ -124,8 +124,7 @@ public: bool mbResetActiveMap;
 public:
 
     // Initialize the SLAM system. It launches the Local Mapping, Loop Closing and Viewer threads.
-    // System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor, const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string(), const string &strLoadingFile = std::string());  // original
-    System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor, rclcpp::Node::SharedPtr node, const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string(), const string &strLoadingFile = std::string());
+    System(const string &strSettingsFile, const eSensor sensor, rclcpp::Node::SharedPtr node, const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string(), const string &strLoadingFile = std::string(), BackendMode backendMode = BackendMode::GtsamDynamic);
 
 	cv::Mat TrackStereoGroDVL(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::ImuPoint>& vImuMeas = vector<IMU::ImuPoint>(), bool bDVL= false, string filename="",
 	                         const std::vector<cv::Point2f>& vExtLeft = std::vector<cv::Point2f>(),
@@ -213,18 +212,11 @@ public:
     void SaveAtlas(const string &out_path, int type);
 	bool LoadAtlas(string filename, int type);
 	DenseMapper* mpDenseMapper;
-	string mStrVocabularyFilePath;
-
 private:
 
 
-    string CalculateCheckSum(string filename, int type);
-
     // Input sensor
     eSensor mSensor;
-
-    // ORB vocabulary used for place recognition and feature matching.
-    ORBVocabulary* mpVocabulary;
 
     // KeyFrame database for place recognition (relocalization and loop detection).
     KeyFrameDatabase* mpKeyFrameDatabase;
@@ -237,6 +229,9 @@ private:
     // It also decides when to insert a new keyframe, create some new MapPoints and
     // performs relocalization if tracking fails.
     Tracking* mpTracker;
+
+    // One process-lifetime backend selector shared by all estimator stages.
+    std::shared_ptr<const BackendFacade> mpBackendFacade;
 
     // Local Mapper. It manages the local map and performs local bundle adjustment.
     LocalMapping* mpLocalMapper;

@@ -10,11 +10,6 @@ from ament_index_python.packages import get_package_share_directory
 def generate_launch_description():
     pkg_share = get_package_share_directory('aqua_slam')
 
-    vocab_arg = DeclareLaunchArgument(
-        'vocab',
-        default_value=os.path.join(pkg_share, 'Vocabulary', 'ORBvoc.txt'),
-        description='Path to ORB vocabulary file',
-    )
     settings_arg = DeclareLaunchArgument(
         'settings',
         default_value=os.path.join(pkg_share, 'data', 'underwater_orbslam3_blue_gx5_short.yaml'),
@@ -30,7 +25,7 @@ def generate_launch_description():
         package='aqua_slam',
         executable='aqua_slam_node',
         name='stereo_dvl',
-        arguments=[LaunchConfiguration('vocab'), LaunchConfiguration('settings')],
+        arguments=[LaunchConfiguration('settings')],
         output='screen',
     )
 
@@ -71,7 +66,6 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        vocab_arg,
         settings_arg,
         use_rviz_arg,
         static_tf,

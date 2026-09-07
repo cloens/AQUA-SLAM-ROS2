@@ -53,7 +53,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>
 
-#include "Thirdparty/DBoW2/DUtils/Random.h"
+#include "Random.h"
 #include <algorithm>
 
 using namespace std;
@@ -177,7 +177,7 @@ cv::Mat PnPsolver::iterate(int nIterations, bool &bNoMore,
 
         for(short i = 0; i < mRansacMinSet; ++i)
         {
-            int randi = DUtils::Random::RandomInt(0, vAvailableIndices.size()-1);
+            int randi = RandomInt(0, vAvailableIndices.size()-1);
             int idx = vAvailableIndices[randi];
 
             add_correspondence(

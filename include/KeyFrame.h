@@ -21,17 +21,22 @@
 #define KEYFRAME_H
 
 
-#include "Thirdparty/DBoW2/DBoW2/BowVector.h"
-#include "Thirdparty/DBoW2/DBoW2/FeatureVector.h"
-#include "ORBVocabulary.h"
-#include "ORBextractor.h"
 #include "ImuTypes.h"
 #include <DVLGroPreIntegration.h>
 
 #include "GeometricCamera.h"
 
+#include <algorithm>
+#include <iostream>
+#include <list>
+#include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/vector.hpp>
@@ -40,6 +45,23 @@
 
 namespace ORB_SLAM3
 {
+using std::cout;
+using std::endl;
+using std::list;
+using std::make_pair;
+using std::map;
+using std::max;
+using std::min;
+using std::mutex;
+using std::pair;
+using std::set;
+using std::string;
+using std::stringstream;
+using std::tuple;
+using std::unique_lock;
+using std::vector;
+using std::get;
+
 
 class Map;
 class MapPoint;
@@ -249,9 +271,6 @@ class KeyFrame
         ar & const_cast<vector<float>& >(mvuRight);
         ar & const_cast<vector<float>& >(mvDepth);
         serializeMatrix(ar,mDescriptors,version);
-        // BOW
-        ar & mBowVec;
-        ar & mFeatVec;
         // Pose relative to parent
         serializeMatrix(ar,mTcp,version);
         // Scale
@@ -266,6 +285,8 @@ class KeyFrame
         ar & const_cast<int&>(mnMinY);
         ar & const_cast<int&>(mnMaxX);
         ar & const_cast<int&>(mnMaxY);
+        ar & const_cast<int&>(mnImageWidth);
+        ar & const_cast<int&>(mnImageHeight);
         serializeMatrix(ar,mK,version);
 //		ar & mPrevKF;
 //		ar & mNextKF;
@@ -359,9 +380,6 @@ public:
     void GetDvlVelocityMeasurement(Eigen::Vector3d& v_d);
     void SetDvlVelocity(const Eigen::Vector3d& v_d);
 
-    // Bag of Words Representation
-    void ComputeBoW();
-
     // Covisibility graph functions
     void AddConnection(KeyFrame* pKF, const int &weight);
     void EraseConnection(KeyFrame* pKF);
@@ -408,6 +426,7 @@ public:
 
     // Image
     bool IsInImage(const float &x, const float &y) const;
+    cv::Size ImageSize() const;
 
     // Enable/Disable bad flag changes
     void SetNotErase();
@@ -443,7 +462,6 @@ public:
     void PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsigned int, MapPoint*>& mpMPid, map<unsigned int, GeometricCamera*>& mpCamId);
 
 
-    void SetORBVocabulary(ORBVocabulary* pORBVoc);
     void SetKeyFrameDatabase(KeyFrameDatabase* pKFDB);
 
     bool bImu;
@@ -527,10 +545,6 @@ public:
     const std::vector<float> mvDepth; // negative value for monocular points
     const cv::Mat mDescriptors;
 
-    //BoW
-    DBoW2::BowVector mBowVec;
-    DBoW2::FeatureVector mFeatVec;
-
     // Pose relative to parent (this is computed when bad flag is activated)
     cv::Mat mTcp;
 
@@ -547,6 +561,8 @@ public:
     const int mnMinY;
     const int mnMaxX;
     const int mnMaxY;
+    const int mnImageWidth;
+    const int mnImageHeight;
     const cv::Mat mK;
 
     // Preintegrated IMU measurements from previous keyframe
@@ -599,9 +615,7 @@ protected:
     // For save relation without pointer, this is necessary for save/load function
     std::vector<long long int> mvBackupMapPointsId;
 
-    // BoW
     KeyFrameDatabase* mpKeyFrameDB;
-    ORBVocabulary* mpORBvocabulary;
 
 
 
@@ -693,7 +707,7 @@ public:
 	bool mbDVL= false;
 
 	// Dvl and Gyro preintegration from last Keyframe
-	DVLGroPreIntegration *mpDvlPreintegrationKeyFrame;
+	DVLGroPreIntegration *mpDvlPreintegrationKeyFrame = nullptr;
     DVLGroPreIntegration *mpDvlPreintegrationLossRefKF=nullptr;
     KeyFrame* mpLossRefKF = nullptr;
     bool mPoorVision;

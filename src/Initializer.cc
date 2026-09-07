@@ -18,10 +18,9 @@
 
 #include "Initializer.h"
 
-#include "Thirdparty/DBoW2/DUtils/Random.h"
+#include "Random.h"
 
-#include "Optimizer.h"
-#include "ORBmatcher.h"
+#include "FeatureMatcher.h"
 
 #include<thread>
 #include <include/CameraModels/Pinhole.h>
@@ -76,7 +75,7 @@ bool Initializer::Initialize(const Frame &CurrentFrame, const vector<int> &vMatc
     // Generate sets of 8 points for each RANSAC iteration
     mvSets = vector< vector<size_t> >(mMaxIterations,vector<size_t>(8,0));
 
-    DUtils::Random::SeedRandOnce(0);
+    SeedRandomOnce(0U);
 
     for(int it=0; it<mMaxIterations; it++)
     {
@@ -85,7 +84,7 @@ bool Initializer::Initialize(const Frame &CurrentFrame, const vector<int> &vMatc
         // Select a minimum set
         for(size_t j=0; j<8; j++)
         {
-            int randi = DUtils::Random::RandomInt(0,vAvailableIndices.size()-1);
+            int randi = RandomInt(0,vAvailableIndices.size()-1);
             int idx = vAvailableIndices[randi];
 
             mvSets[it][j] = idx;
@@ -100,8 +99,8 @@ bool Initializer::Initialize(const Frame &CurrentFrame, const vector<int> &vMatc
     float SH, SF;
     cv::Mat H, F;
 
-    thread threadH(&Initializer::FindHomography,this,ref(vbMatchesInliersH), ref(SH), ref(H));
-    thread threadF(&Initializer::FindFundamental,this,ref(vbMatchesInliersF), ref(SF), ref(F));
+    std::thread threadH(&Initializer::FindHomography,this,std::ref(vbMatchesInliersH), std::ref(SH), std::ref(H));
+    std::thread threadF(&Initializer::FindFundamental,this,std::ref(vbMatchesInliersF), std::ref(SF), std::ref(F));
 
     //cout << "5" << endl;
 

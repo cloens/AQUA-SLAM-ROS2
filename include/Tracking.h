@@ -26,26 +26,45 @@
 
 // #include <ros/ros.h>  // original
 #include"Frame.h"
-#include "ORBVocabulary.h"
-#include"KeyFrameDatabase.h"
-#include"ORBextractor.h"
+#include "KeyFrame.h"
+#include"KeyFrameRegistry.h"
 #include "Initializer.h"
 // #include "MapDrawer.h"
 #include <DVLGroPreIntegration.h>
 
 #include "ImuTypes.h"
+#include "BackendFacade.h"
+#include "AquaBackendAdapter.h"
+
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+#include "GtsamBackendAdapter.h"
+#include "DynamicKeyframeDvlBuffer.h"
+#endif
 
 #include "GeometricCamera.h"
 
 #include <mutex>
+#include <chrono>
+#include <fstream>
+#include <list>
+#include <memory>
+#include <optional>
+#include <set>
 #include <shared_mutex>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
 namespace ORB_SLAM3
 {
+using std::list;
+using std::set;
+using std::string;
+using std::vector;
+
 class LKTracker;
 class Viewer;
 class FrameDrawer;
@@ -56,13 +75,15 @@ class System;
 class RosHandling;
 class DenseMapper;
 class Integrator;
+class Map;
+class TrackingTestAccess;
 
 class Tracking
 {
+	friend class TrackingTestAccess;
 
 public:
 	Tracking(System *pSys,
-	         ORBVocabulary *pVoc,
 	         FrameDrawer *pFrameDrawer,
 	         Atlas *pAtlas,
 	         KeyFrameDatabase *pKFDB,
@@ -70,13 +91,14 @@ public:
 	         DenseMapper *pDenseMapper,
 	         const string &strSettingPath,
 	         const int sensor,
-	         const string &_nameSeq = std::string());
+	         const string &_nameSeq = std::string(),
+	         std::shared_ptr<const BackendFacade> backendFacade = nullptr);
 
 	~Tracking();
 
 	// Parse the config file
 	bool ParseCamParamFile(cv::FileStorage &fSettings);
-	bool ParseORBParamFile(cv::FileStorage &fSettings);
+	bool ParseFeatureFrontendParamFile(cv::FileStorage &fSettings);
 	bool ParseIMUParamFile(cv::FileStorage &fSettings);
 
 	// Preprocess the input and call Track(). Extract features and performs stereo matching.
@@ -113,6 +135,37 @@ public:
 	// void SetViewer(Viewer *pViewer);
 	void SetStepByStep(bool bSet);
 	void SetExtrinsicPara(IMU::Calib &calib);
+	NeuralFeatureFrontend* FeatureFrontend() const noexcept
+	{
+		return mpFeatureFrontend.get();
+	}
+	BackendMode backendMode() const noexcept { return mBackendMode; }
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+	bool ResetGtsamBackendAtKeyFrame(const cv::Mat& cameraFromMap,
+	                                double keyframeTimestamp);
+	bool RebaseGtsamBackend(const BackendMapSnapshot& snapshot);
+    std::shared_ptr<GtsamPreparedMapOptimization> PrepareDynamicMapOptimization(
+        const BackendMapSnapshot& snapshot,
+        const std::vector<BackendLandmarkReplacement>& replacements = {});
+    bool CommitDynamicMapOptimization(GtsamPreparedMapOptimization& candidate,
+        Map& map, std::uint64_t expectedVersion, KeyFrame* correctionReference);
+    void UpdateDynamicRecoveryState(bool visualTracked, bool predictionAccepted);
+	std::unique_lock<std::recursive_timed_mutex> AcquireDynamicMapTransaction();
+	std::unique_lock<std::recursive_timed_mutex> TryAcquireDynamicMapTransaction();
+	bool CaptureCommittedKeyframeWatermark(
+		CommittedKeyframeWatermark* watermark) const;
+	bool AdvanceCommittedWatermarkMapVersion(
+		std::uint64_t expectedVersion, std::uint64_t newVersion);
+	void RecordDynamicDiagnostics(const BackendMapDiagnostics& diagnostics);
+	std::optional<BackendMapDiagnostics> LatestDynamicDiagnostics() const;
+	void RecordGtsamRebaseProjectionRejected(const std::string& reason);
+	void RecordGtsamRebaseSucceeded();
+		void SynchronizeAfterMapCorrection(const cv::Mat& oldCameraFromMap,
+		                                  const cv::Mat& newCameraFromMap);
+		bool CommitDynamicMapResult(const BackendMapResult& result, Map& map,
+		                            std::uint64_t expectedVersion,
+		                            KeyFrame* correctionReference);
+#endif
 
 	// Load new settings
 	// The focal lenght should be similar or scale prediction will fail when projecting points
@@ -216,6 +269,7 @@ public:
 	std::vector<cv::Point2f> mvbPrevMatched;
 	std::vector<cv::Point3f> mvIniP3D;
 	Frame mInitialFrame;
+	bool mHasDynamicStereoInitCandidate = false;
 
 	// Lists used to recover the full camera trajectory at the end of the execution.
 	// Basically we store the reference keyframe for each frame and its relative transformation
@@ -279,6 +333,7 @@ public:
 	double mDVL_func_debug;
 
 protected:
+	Tracking() = default;
 
 	// Main tracking function. It is independent of the input sensor.
 	void Track();
@@ -299,6 +354,7 @@ protected:
 	void CheckReplacedInLastFrame();
 	bool TrackReferenceKeyFrame();
 	void UpdateLastFrame();
+	int MatchTemporalMapPoints();
 	bool TrackWithMotionModel();
 	bool TrackWithMotionModelAndEKF();
 	void saveMatchingResults(const cv::Mat &velocity_orb, const cv::Mat &velocity_dvl);
@@ -335,6 +391,17 @@ protected:
 	 * 4 beam DVL model and Gyro + Acc pre_integration
 	 */
 	void PreintegrateDvlGro3();
+	int OptimizeCurrentFrameWithBackend(bool commitIncremental = false,
+	                                  std::uint64_t committingKeyframeId = 0U);
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+	bool TryInitializeGtsamBackend();
+	bool PredictStateWithDynamicBackend();
+	std::shared_ptr<GtsamBackendAdapter> AcquireGtsamBackend() const;
+	bool DynamicLastCommitSucceeded() const;
+	std::uint64_t RecordCommittedKeyframeWatermark(
+		std::uint64_t keyframeId, double timestampSec, Map& map);
+	void ResetDynamicBackendState();
+#endif
 
 	// Reset IMU biases and compute frame velocity
 	void ResetFrameIMU();
@@ -359,16 +426,43 @@ protected:
 
 	// Vector of IMU measurements from previous to current frame (to be filled by PreintegrateIMU)
 	std::vector<IMU::ImuPoint> mvImuFromLastFrame;
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+	DynamicKeyframeImuBuffer mDynamicKeyframeImu;
+	DynamicKeyframeDvlBuffer mDynamicKeyframeDvl;
+#endif
 	std::vector<IMU::GyroDvlPoint> mvGyroDVLFromLastFrame;
 	std::mutex mMutexImuQueue;
 
 	// Imu calibration parameters
 	IMU::Calib *mpImuCalib;
+	double mImuFrequencyHz = 0.0;
+	DvlTrackMode mDvlTrackMode = DvlTrackMode::Unknown;
+	std::string mDvlUncertaintyProfilePath;
 	std::mutex mMutexExtrinsic;
 
 	// Last Bias Estimation (at keyframe creation)
 	std::shared_mutex mBiasMutex;
 	IMU::Bias mLastBias;
+	BackendMode mBackendMode = BackendMode::GtsamDynamic;
+	std::shared_ptr<const BackendFacade> mpBackendFacade;
+#ifdef AQUA_HAS_GTSAM_DYNAMIC
+	std::shared_ptr<GtsamBackendAdapter> mpGtsamBackend;
+	std::vector<ImuSample> mDynamicInitializationImu;
+    double mLastDynamicInitializationAttempt =
+        -std::numeric_limits<double>::infinity();
+    std::optional<std::uint64_t> mLastDynamicInitializationTopology;
+	bool mCollectDynamicInitializationImu = false;
+	bool mDynamicLastCommitSucceeded = false;
+	mutable std::mutex mMutexDynamicState;
+	std::recursive_timed_mutex mMutexDynamicMapTransaction;
+	CommittedKeyframeWatermark mDynamicCommittedWatermark;
+	bool mHasDynamicCommittedWatermark = false;
+	std::optional<BackendMapDiagnostics> mLatestDynamicDiagnostics;
+	std::size_t mDynamicRebaseRejectionCount = 0U;
+	std::chrono::steady_clock::time_point mDynamicRebaseStaleSince;
+	bool mDynamicRebaseWarningLatched = false;
+	std::uint64_t mDynamicCommitSequence = 0U;
+#endif
 
 	// In case of performing only localization, this flag is true when there are no matches to
 	// points in the map. Still tracking will continue if there are enough matches with temporal points.
@@ -380,12 +474,11 @@ protected:
 	LocalMapping *mpLocalMapper;
 	LoopClosing *mpLoopClosing;
 
-	//ORB
-	ORBextractor *mpORBextractorLeft, *mpORBextractorRight;
-	ORBextractor *mpIniORBextractor;
+	std::unique_ptr<NeuralFeatureFrontend> mpFeatureFrontend;
+	int mnFeatureTarget = 0;
+	float mStereoMaxVerticalError = 0.0F;
 
 	//BoW
-	ORBVocabulary *mpORBVocabulary;
 	KeyFrameDatabase *mpKeyFrameDB;
 
 	// Initalization (only for monocular)
@@ -407,7 +500,7 @@ protected:
 	bool bStepByStep;
 
 	//Atlas
-	Atlas *mpAtlas;
+	Atlas *mpAtlas = nullptr;
 	Map *mpMapToReset;
 	DenseMapper *mpDenseMapper;
 
@@ -461,9 +554,9 @@ protected:
 
 	int mnNumDataset;
 
-	ofstream f_track_stats;
+	std::ofstream f_track_stats;
 
-	ofstream f_track_times;
+	std::ofstream f_track_times;
 	double mTime_PreIntIMU;
 	double mTime_PosePred;
 	double mTime_LocalMapTrack;

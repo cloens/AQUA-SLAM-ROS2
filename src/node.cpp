@@ -4,6 +4,7 @@
 #include <mutex>
 #include <chrono>
 #include <optional>
+#include <cmath>
 
 #include "rclcpp/rclcpp.hpp"
 #include <sensor_msgs/msg/imu.hpp>
@@ -15,6 +16,8 @@
 #include <opencv2/core/core.hpp>
 
 #include "System.h"
+#include "BackendFacade.h"
+#include "DvlObservationAdapter.h"
 #include "ImuTypes.h"
 
 // Optional: StereoMatches from uw_slam_bridge when built in same workspace.
@@ -33,24 +36,51 @@ public:
     void GrabImu(const sensor_msgs::msg::Imu::ConstSharedPtr &imu_msg)
     {
         unique_lock<mutex> lock(mBufMutex);
+        const double timestamp = rclcpp::Time(imu_msg->header.stamp).seconds();
+        if (mReceivedCount > 0U) {
+            const double gap = timestamp - mLastReceivedTimestamp;
+            if (gap > mMaximumReceivedGap)
+                mMaximumReceivedGap = gap;
+            if (gap > 0.1)
+                RCLCPP_WARN(rclcpp::get_logger("aqua_slam_node"),
+                            "IMU subscriber gap previous=%.9f current=%.9f gap=%.9f received=%zu",
+                            mLastReceivedTimestamp, timestamp, gap,
+                            mReceivedCount);
+        }
+        mLastReceivedTimestamp = timestamp;
+        ++mReceivedCount;
         imuBuf.push(imu_msg);
     }
 
     queue<sensor_msgs::msg::Imu::ConstSharedPtr> imuBuf;
     mutex mBufMutex;
+    std::size_t mReceivedCount = 0U;
+    double mLastReceivedTimestamp = 0.0;
+    double mMaximumReceivedGap = 0.0;
 };
 
 class DVLGrabber
 {
 public:
-    void GrabDVL(const nav_msgs::msg::Odometry::SharedPtr &msg)
+    void GrabDVL(const uw_slam_bridge::msg::DvlObservation::SharedPtr &msg)
     {
         unique_lock<mutex> lock(mBufMutex);
+        const double timestamp = rclcpp::Time(msg->header.stamp).seconds();
+        if (!ORB_SLAM3::fromDvlObservation(*msg).has_value() ||
+            (mReceivedCount > 0U && timestamp <= mLastTimestamp)) {
+            ++mRejectedCount;
+            return;
+        }
+        mLastTimestamp = timestamp;
+        ++mReceivedCount;
         dvlBuf.push(msg);
     }
 
-    queue<nav_msgs::msg::Odometry::SharedPtr> dvlBuf;
+    queue<uw_slam_bridge::msg::DvlObservation::SharedPtr> dvlBuf;
     mutex mBufMutex;
+    std::size_t mReceivedCount = 0U;
+    std::size_t mRejectedCount = 0U;
+    double mLastTimestamp = 0.0;
 };
 
 struct ExternalFrontEnd
@@ -65,8 +95,10 @@ struct ExternalFrontEnd
 class ImageGrabber
 {
 public:
-    ImageGrabber(ORB_SLAM3::System *pSLAM, ImuGrabber *pImuGb, DVLGrabber *pDvlGb, bool useDvl)
-        : mpSLAM(pSLAM), mpImuGb(pImuGb), mpDvlGb(pDvlGb), mUseDvl(useDvl) {}
+    ImageGrabber(ORB_SLAM3::System *pSLAM, ImuGrabber *pImuGb, DVLGrabber *pDvlGb,
+                 bool useDvl, double stereoMaxSkewSec)
+        : mpSLAM(pSLAM), mpImuGb(pImuGb), mpDvlGb(pDvlGb), mUseDvl(useDvl),
+          mStereoMaxSkewSec(stereoMaxSkewSec) {}
 
     void GrabImageLeft(const sensor_msgs::msg::Image::SharedPtr &msg)
     {
@@ -204,8 +236,8 @@ public:
 
     void SyncWithImu()
     {
-        const double maxTimeDiff = 0.005;
-        while (true) {
+        const double maxTimeDiff = mStereoMaxSkewSec;
+        while (rclcpp::ok()) {
             cv::Mat imLeft, imRight;
             double tImLeft = 0, tImRight = 0;
 
@@ -268,6 +300,16 @@ public:
                     while (!mpImuGb->imuBuf.empty() &&
                            rclcpp::Time(mpImuGb->imuBuf.front()->header.stamp).seconds() <= tImLeft) {
                         double t = rclcpp::Time(mpImuGb->imuBuf.front()->header.stamp).seconds();
+                        if (mConsumedImuCount > 0U) {
+                            const double gap = t - mLastConsumedImuTimestamp;
+                            if (gap > 0.1)
+                                RCLCPP_WARN(rclcpp::get_logger("aqua_slam_node"),
+                                            "IMU sync gap previous=%.9f current=%.9f gap=%.9f consumed=%zu",
+                                            mLastConsumedImuTimestamp, t, gap,
+                                            mConsumedImuCount);
+                        }
+                        mLastConsumedImuTimestamp = t;
+                        ++mConsumedImuCount;
                         const auto &imu = mpImuGb->imuBuf.front();
                         float ax = imu->linear_acceleration.x;
                         float ay = imu->linear_acceleration.y;
@@ -281,26 +323,56 @@ public:
                             cv::Point3f(ax, ay, az), cv::Point3f(wx, wy, wz), t));
                         mpImuGb->imuBuf.pop();
                     }
+
+                    // Preserve the first physical IMU sample after the camera
+                    // boundary. Do not consume it: the next camera interval
+                    // reuses this same acquisition sample as its left bracket.
+                    if (!mpImuGb->imuBuf.empty()) {
+                        const auto &rightBracket = mpImuGb->imuBuf.front();
+                        const double t = rclcpp::Time(
+                            rightBracket->header.stamp).seconds();
+                        float ax = rightBracket->linear_acceleration.x;
+                        float ay = rightBracket->linear_acceleration.y;
+                        float az = rightBracket->linear_acceleration.z;
+                        float wx = rightBracket->angular_velocity.x;
+                        float wy = rightBracket->angular_velocity.y;
+                        float wz = rightBracket->angular_velocity.z;
+                        vGyroDVLMeas.push_back(ORB_SLAM3::IMU::GyroDvlPoint(
+                            ax, ay, az, wx, wy, wz, 0, 0, 0, 0, 0, 0, 0, t));
+                        vImuMeas.push_back(ORB_SLAM3::IMU::ImuPoint(
+                            cv::Point3f(ax, ay, az), cv::Point3f(wx, wy, wz), t));
+                    }
+                    // End physical IMU right bracket.
                 }
 
+                std::vector<uw_slam_bridge::msg::DvlObservation::SharedPtr>
+                    intervalDvl;
                 {
                     unique_lock<mutex> lock(mpDvlGb->mBufMutex);
                     while (!mpDvlGb->dvlBuf.empty() &&
                            rclcpp::Time(mpDvlGb->dvlBuf.front()->header.stamp).seconds() <= tImLeft) {
-                        double t = rclcpp::Time(mpDvlGb->dvlBuf.front()->header.stamp).seconds();
                         const auto &dvl = mpDvlGb->dvlBuf.front();
-                        float vx = dvl->twist.twist.linear.x;
-                        float vy = dvl->twist.twist.linear.y;
-                        float vz = dvl->twist.twist.linear.z;
-                        vDVLMeas.push_back(ORB_SLAM3::IMU::DvlPoint(vx, vy, vz, 0, 0, 0, 0, t));
-                        vGyroDVLMeas.push_back(ORB_SLAM3::IMU::GyroDvlPoint(
-                            0, 0, 0, 0, 0, 0, vx, vy, vz, 0, 0, 0, 0, t));
+                        intervalDvl.push_back(dvl);
                         mpDvlGb->dvlBuf.pop();
                     }
                 }
-
-                if (vDVLMeas.size() >= 2)
-                    vDVLMeas.resize(1);
+                for (const auto &dvl : intervalDvl) {
+                    const double dvlTime =
+                        rclcpp::Time(dvl->header.stamp).seconds();
+                    const auto &velocity = dvl->velocity;
+                    vDVLMeas.emplace_back(
+                        velocity.x, velocity.y, velocity.z, dvlTime);
+                    auto measurement = *ORB_SLAM3::fromDvlObservation(*dvl);
+                    const auto gyro = std::find_if(
+                        vGyroDVLMeas.rbegin(), vGyroDVLMeas.rend(),
+                        [&measurement](const ORB_SLAM3::IMU::GyroDvlPoint &sample) {
+                            return !sample.isDvlMeasurement &&
+                                   sample.t <= measurement.t;
+                        });
+                    if (gyro != vGyroDVLMeas.rend())
+                        measurement.dvlAngularVelocityBody = gyro->angular_v;
+                    vGyroDVLMeas.push_back(measurement);
+                }
 
                 // DVL-optional: IMU-only is enough to proceed with bDVL=false.
                 if (vGyroDVLMeas.empty())
@@ -352,6 +424,9 @@ public:
     ImuGrabber        *mpImuGb;
     DVLGrabber        *mpDvlGb;
     bool mUseDvl;
+    double mStereoMaxSkewSec;
+    std::size_t mConsumedImuCount = 0U;
+    double mLastConsumedImuTimestamp = 0.0;
 };
 
 int main(int argc, char **argv)
@@ -359,14 +434,14 @@ int main(int argc, char **argv)
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("aqua_slam_node");
 
-    if (argc < 3) {
+    if (argc < 2) {
         RCLCPP_ERROR(node->get_logger(),
-                     "Usage: aqua_slam_node <path_to_vocabulary> <path_to_settings>");
+                     "Usage: aqua_slam_node <path_to_settings>");
         rclcpp::shutdown();
         return 1;
     }
 
-    cv::FileStorage fsSettings(argv[2], cv::FileStorage::READ);
+    cv::FileStorage fsSettings(argv[1], cv::FileStorage::READ);
     string imu_topic   = fsSettings["ImuTopic"];
     string dvl_topic   = fsSettings["DvlTopic"];
     string img_l_topic = fsSettings["LeftImgTopic"];
@@ -381,10 +456,22 @@ int main(int argc, char **argv)
         depth_topic = "/uw_slam/depth/scaled";
     if (matches_topic.empty())
         matches_topic = "/uw_slam/stereo_matches";
+    double stereo_max_skew_sec = 0.005;
+    if (!fsSettings["StereoMaxSkewMs"].empty())
+        stereo_max_skew_sec = (double)fsSettings["StereoMaxSkewMs"] / 1000.0;
 
     string sensor_mode = "stereo_inertial_dvl";
     if (!fsSettings["SensorMode"].empty())
         sensor_mode = (string)fsSettings["SensorMode"];
+    string backend_mode_name = "GTSAM_DYNAMIC";
+    if (!fsSettings["BackendMode"].empty())
+        backend_mode_name = (string)fsSettings["BackendMode"];
+    ORB_SLAM3::RuntimeProfile runtime_profile;
+    runtime_profile.sensorMode = sensor_mode;
+    runtime_profile.dvlEnabled = sensor_mode == "stereo_inertial_dvl";
+    const auto backend_mode = ORB_SLAM3::loadBackendMode(backend_mode_name);
+    ORB_SLAM3::selectEstimatorMode(runtime_profile);
+    const ORB_SLAM3::BackendFacade backend_facade(backend_mode);
     const bool use_dvl = sensor_mode == "stereo_inertial_dvl";
     const auto sensor = use_dvl ? ORB_SLAM3::System::DVL_STEREO : ORB_SLAM3::System::IMU_STEREO;
 
@@ -397,24 +484,32 @@ int main(int argc, char **argv)
 
     RCLCPP_INFO(node->get_logger(), "sensor mode: %s (DVL %s)",
                 sensor_mode.c_str(), use_dvl ? "enabled" : "disabled");
-    ORB_SLAM3::System SLAM(argv[1], argv[2], sensor, node, false);
+    RCLCPP_INFO(node->get_logger(), "backend mode: %s (immutable)",
+                backend_mode_name.c_str());
+    ORB_SLAM3::System SLAM(argv[1], sensor, node, false, 0,
+                           std::string(), std::string(), backend_mode);
 
     ImuGrabber   imugb;
     DVLGrabber   dvlgb;
-    ImageGrabber igb(&SLAM, &imugb, &dvlgb, use_dvl);
+    ImageGrabber igb(&SLAM, &imugb, &dvlgb, use_dvl,
+                     stereo_max_skew_sec);
 
+    auto imu_callback_group = node->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions imu_subscription_options;
+    imu_subscription_options.callback_group = imu_callback_group;
     auto imu_sub = node->create_subscription<sensor_msgs::msg::Imu>(
-        imu_topic, 100,
+        imu_topic, rclcpp::QoS(rclcpp::KeepAll()).reliable(),
         [&imugb](const sensor_msgs::msg::Imu::ConstSharedPtr &msg) {
             imugb.GrabImu(msg);
-        });
+        }, imu_subscription_options);
 
     // DVL remains subscribed, but empty DVL is allowed.
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr dvl_sub;
+    rclcpp::Subscription<uw_slam_bridge::msg::DvlObservation>::SharedPtr dvl_sub;
     if (use_dvl && !dvl_topic.empty()) {
-        dvl_sub = node->create_subscription<nav_msgs::msg::Odometry>(
+        dvl_sub = node->create_subscription<uw_slam_bridge::msg::DvlObservation>(
             dvl_topic, 100,
-            [&dvlgb](const nav_msgs::msg::Odometry::SharedPtr msg) {
+            [&dvlgb](const uw_slam_bridge::msg::DvlObservation::SharedPtr msg) {
                 dvlgb.GrabDVL(msg);
             });
     }
@@ -447,12 +542,16 @@ int main(int argc, char **argv)
         });
 #else
     RCLCPP_WARN(node->get_logger(),
-                "uw_slam_bridge/StereoMatches not found at build time; ORB stereo fallback remains active");
+                "uw_slam_bridge/StereoMatches not found at build time; internal neural stereo remains active");
 #endif
 
     thread sync_thread(&ImageGrabber::SyncWithImu, &igb);
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor(
+        rclcpp::ExecutorOptions(), 2U);
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     sync_thread.join();
+    SLAM.Shutdown();
     return 0;
 }
